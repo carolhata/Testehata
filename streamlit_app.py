@@ -5,18 +5,6 @@ st.title("🔐 Teste de API Key da OpenAI")
 # Tentativa de leitura segura da chave
 api_key = st.secrets.get("OPENAI_API_KEY")
 
-if api_key:
-    st.success("✅ OPENAI_API_KEY encontrada no st.secrets! Tudo certo 🎉")
-else:
-    st.error("❌ OPENAI_API_KEY não encontrada.")
-    st.info("""
-    Vá até o Streamlit Cloud → Settings → Secrets
-    e adicione no formato correto (TOML):
-
-    ```
-    OPENAI_API_KEY = "sua_chave_aqui"
-    ```
-    """)
 
 
 

@@ -815,12 +815,24 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "listings"):
 
 if st.session_state.get("scrape_df") is not None:
     df_preview = st.session_state.scrape_df.copy()
-    st.markdown("Prévia dos resultados:")
-    st.dataframe(df_preview.head(200))
+
+    # 🔒 Sanitiza para exibição (remove objetos incompatíveis com PyArrow)
+    df_preview_display = sanitize_df_for_display(df_preview, max_cell_len=2000)
+
+    st.markdown("Prévia dos resultados (limpa para exibição):")
+    st.dataframe(df_preview_display.head(100))  # pode aumentar para 200 se quiser
+
+    # ✅ Gera arquivo Excel seguro para download (mantém estrutura original)
     fname = f"quintoandar_listings_filtered_{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
-    st.download_button("Baixar Excel (listings)", data=df_to_excel_bytes(df_preview), file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(
+        "Baixar Excel (listings)",
+        data=df_to_excel_bytes(df_preview),
+        file_name=fname,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 else:
     st.info("Sem DataFrame disponível. Execute uma extração.")
+
 
 with st.expander("Diagnóstico / Amostras (útil para ajustes)"):
     st.write("URL atual:", st.session_state.get("scrape_url"))

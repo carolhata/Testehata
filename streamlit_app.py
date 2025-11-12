@@ -886,6 +886,7 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "listings"):
     bio.seek(0)
     return bio.read()
 
+# === [INÍCIO BLOCO: Exibição e Download dos Resultados] ===
 if st.session_state.get("scrape_df") is not None:
     df_preview = st.session_state.scrape_df.copy()
 
@@ -925,7 +926,7 @@ if st.session_state.get("scrape_df") is not None:
     )
 else:
     st.info("Sem DataFrame disponível. Execute uma extração.")
-
+# === [FIM BLOCO: Exibição e Download dos Resultados] ===
 
 
 with st.expander("Diagnóstico / Amostras (útil para ajustes)"):

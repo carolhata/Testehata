@@ -41,18 +41,38 @@ if not OPENAI_API_KEY:
     st.stop()
 
 # =========================
-# Inicialização segura do cliente OpenAI (modo legacy)
+# Inicialização robusta do cliente OpenAI (API moderna)
 # =========================
-# Usamos o módulo legacy `openai` para evitar problemas de dependências (httpx) no ambiente.
-import openai as _openai_module  # module-style client
+# Observação: a API moderna requer 'openai>=1.0.0' e httpx instalado no ambiente.
+# Se a inicialização falhar, mostramos instruções claras para o deploy.
+_openai_client_mode = None
+client = None
+try:
+    # import correto para openai moderno
+    from openai import OpenAI as _OpenAIClass  # type: ignore
+    # garantir a variável de ambiente (alguns clientes a leem)
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    # instanciar client passando a chave explicitamente
+    try:
+        client = _OpenAIClass(api_key=OPENAI_API_KEY)
+        _openai_client_mode = "modern-explicit"
+    except TypeError:
+        # fallback: set api_key on module and instantiate without param
+        import openai as _openai_module_for_env  # type: ignore
+        _openai_module_for_env.api_key = OPENAI_API_KEY
+        client = _OpenAIClass()
+        _openai_client_mode = "modern-env"
+except Exception as e_modern:
+    # Se falhar, exibir erro instrutivo (muitas vezes falta httpx).
+    logger.exception("Falha ao inicializar OpenAI moderno")
+    st.error(
+        "Falha ao inicializar cliente OpenAI moderno. "
+        "Provavelmente falta a dependência 'httpx' no ambiente do Streamlit Cloud.\n\n"
+        "Ação recomendada: adicione `httpx==0.24.1` ao requirements.txt e redeploy.\n\n"
+        f"Detalhe técnico: {e_modern}"
+    )
+    st.stop()
 
-# Garantir que alguns SDKs/leitores de ambiente encontrem a chave
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-_openai_module.api_key = OPENAI_API_KEY
-
-# apontamos 'client' para o módulo legacy para compatibilidade com ChatCompletion streaming
-client = _openai_module
-_openai_client_mode = "legacy-module"
 logger.info(f"OpenAI client mode: {_openai_client_mode}")
 
 # =========================
@@ -233,17 +253,17 @@ st.title("🧠 Meu ChatGPT com Tavily + Raspagem HTML")
 st.caption("Raspagem direta com fallback para Tavily Extract e Jina Reader. Exportação para Excel no sidebar.")
 
 # =========================
-# Utilidades de IA e Web
+# Utilidades de IA e Web (usando API moderna)
 # =========================
 def openai_stream_chat(messages: List[dict], model: str, temperature: float, max_tokens: int, system_prompt: str):
     """
-    Streaming usando o módulo legacy `openai` (client = openai).
-    Espera-se que client.ChatCompletion.create(..., stream=True) retorne um gerador de chunks dict-like.
+    Usa a API moderna: client.chat.completions.create(..., stream=True)
+    client é instância de openai.OpenAI()
     """
     full_messages = [{"role": "system", "content": system_prompt}] + messages
 
     try:
-        stream = client.ChatCompletion.create(
+        stream = client.chat.completions.create(
             model=model,
             messages=full_messages,
             temperature=temperature,
@@ -251,29 +271,37 @@ def openai_stream_chat(messages: List[dict], model: str, temperature: float, max
             stream=True
         )
     except Exception as e:
-        logger.exception("Erro ao iniciar stream OpenAI (legacy)")
+        logger.exception("Erro ao iniciar stream OpenAI (moderno)")
         raise
 
     partial = ""
     placeholder = st.empty()
-    try:
-        for chunk in stream:
+
+    # Itera sobre chunks que podem ser objetos com attribute .choices[...]...
+    for chunk in stream:
+        content_piece = None
+        try:
+            # chunk pode ser objeto; extrair de forma resiliente
+            choice0 = chunk.choices[0]
+            delta = getattr(choice0, "delta", None)
+            if isinstance(delta, dict):
+                content_piece = delta.get("content") or delta.get("text")
+            else:
+                content_piece = getattr(delta, "content", None) if delta is not None else None
+        except Exception:
+            # tenta extrair via dict-like (fallback)
             try:
-                # chunk é dict-like: {'choices': [{'delta': {'content': '...'}}], ...}
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {}) or {}
-                content_piece = delta.get("content") or delta.get("text") or None
+                chunk_d = dict(chunk)
+                choices = chunk_d.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    content_piece = delta.get("content") or delta.get("text")
             except Exception:
                 content_piece = None
 
-            if content_piece:
-                partial += content_piece
-                placeholder.markdown(partial)
-    except Exception as e:
-        logger.exception("Erro durante streaming (legacy)")
-        raise
+        if content_piece:
+            partial += content_piece
+            placeholder.markdown(partial)
 
     return partial
 
@@ -554,3 +582,4 @@ st.caption(
     "Secrets necessários: OPENAI_API_KEY e (opcional) TAVILY_API_KEY. "
     "Nenhuma chave é armazenada no código."
 )
+

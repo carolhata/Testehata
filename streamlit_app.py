@@ -1,517 +1,461 @@
 # streamlit_app.py
-# Versão ajustada para garantir que st.set_page_config seja a PRIMEIRA chamada do Streamlit
-
+# Template ajustado para raspagem de resultados de busca (listings) e exportação Excel
 import os
 import re
 import json
 import logging
 from io import BytesIO
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from typing import List, Literal, Optional, Dict, Any
 from datetime import datetime, timezone
 
-# IMPORT STREAMLIT primeiro (ok) e set_page_config deve ser a PRIMEIRA chamada do st no módulo
 import streamlit as st
 
+# MUST be the first Streamlit command in this module
 st.set_page_config(
-    page_title="Meu ChatGPT + Web (Tavily) + Raspagem HTML",
-    page_icon="🧠",
+    page_title="Raspador de Listings → Excel",
+    page_icon="🧾",
     layout="centered"
 )
 
-# agora é seguro usar outros recursos do módulo
+# safe to import rest
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, PositiveInt, validator
 
-# -------------------------
 # logging
-# -------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("chatgpt-web-scraper-app")
+logger = logging.getLogger("listings-scraper")
 
 # =========================
-# Secrets seguros (uso APÓS set_page_config)
+# Secrets (after set_page_config)
 # =========================
 def get_secret(name: str) -> Optional[str]:
     try:
-        # st.secrets é seguro para ler aqui (já temos set_page_config acima)
         return st.secrets.get(name, None)
     except Exception:
         return None
 
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+# Tavily optional (leave as is)
 TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
 
-if not OPENAI_API_KEY:
-    st.error("Defina OPENAI_API_KEY em Secrets antes de usar.")
-    st.stop()
-
-# configurar variável de ambiente e cliente OpenAI (import local para evitar exec antes do set_page_config)
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-from openai import OpenAI
-client = OpenAI()
-
+# We won't require OPENAI here; keep optional
 # =========================
-# Modelos e validação
+# App settings data model
 # =========================
-AVAILABLE_MODELS = [
-    "gpt-4o-mini",
-    "gpt-4o",
-    "gpt-4.1-mini",
-    "gpt-4.1"
-]
-
 class AppSettings(BaseModel):
-    model: Literal["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"] = Field(default="gpt-4o-mini")
-    temperature: float = Field(default=0.3, ge=0.0, le=2.0)
-    max_tokens: PositiveInt = Field(default=1024)
-    system_prompt: str = Field(
-        default=(
-            "Você é um assistente de IA útil, objetivo e seguro. "
-            "Responda em português do Brasil, de forma clara e prática."
-        )
-    )
-    use_tavily: bool = Field(default=True)
-    tavily_depth: Literal["basic", "advanced"] = Field(default="basic")
-    tavily_max_results: PositiveInt = Field(default=5)
-    inject_scrape: bool = Field(default=True)
+    # kept minimal for compatibility with previous app
     scrape_char_limit: PositiveInt = Field(default=8000)
 
-    @validator("max_tokens")
-    def clamp_max_tokens(cls, v):
-        return min(v, 4096)
-
 # =========================
-# Estado da sessão (após set_page_config)
+# session_state initialization & normalization
 # =========================
 if "history" not in st.session_state:
     st.session_state.history = []
 if "settings" not in st.session_state:
     st.session_state.settings = AppSettings().dict()
-if "scrape_context" not in st.session_state:
-    st.session_state.scrape_context = ""
+# normalize settings to ensure keys
+try:
+    if not isinstance(st.session_state.settings, dict):
+        st.session_state.settings = AppSettings().dict()
+    else:
+        defaults = AppSettings().dict()
+        for k, v in defaults.items():
+            if k not in st.session_state.settings:
+                st.session_state.settings[k] = v
+except Exception:
+    st.session_state.settings = AppSettings().dict()
+
 if "scrape_url" not in st.session_state:
     st.session_state.scrape_url = ""
-if "scrape_title" not in st.session_state:
-    st.session_state.scrape_title = ""
+if "scrape_df" not in st.session_state:
+    st.session_state.scrape_df = None  # will hold DataFrame of listings
 
 # =========================
-# Utilidades comuns
+# Utilities: parsing helpers
 # =========================
-def normalize_whitespace(text: str) -> str:
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
-    return text.strip()
-
-def build_scrape_dataframe() -> Optional[pd.DataFrame]:
-    txt = (st.session_state.scrape_context or "").strip()
-    url = st.session_state.scrape_url or ""
-    title = st.session_state.scrape_title or ""
-    if not txt:
+def first_text_or_none(el):
+    try:
+        t = el.get_text(separator=" ", strip=True)
+        return t if t else None
+    except Exception:
         return None
-    parts = [p.strip() for p in re.split(r"\n{2,}", txt) if p.strip()]
-    rows = []
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    for i, p in enumerate(parts, start=1):
-        rows.append(
-            {
-                "timestamp_utc": ts,
-                "url": url,
-                "title": title,
-                "paragraph_index": i,
-                "paragraph_length": len(p),
-                "text": p,
-            }
-        )
-    return pd.DataFrame(rows)
 
-def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "scrape") -> bytes:
+money_rx = re.compile(r"(R\$[\s\d\.\,kKmM]+|\d[\d\.\,]*\s*R\$)", re.IGNORECASE)
+m2_rx = re.compile(r"(\d{1,4}\s*(m²|m2|m²|m\^2))", re.IGNORECASE)
+rooms_rx = re.compile(r"(\d+)\s*(quartos|qd|qtos|dormitórios|dormitório)", re.IGNORECASE)
+suite_rx = re.compile(r"(\d+)\s*(suítes|suíte|suite)", re.IGNORECASE)
+vaga_rx = re.compile(r"(\d+)\s*(vagas|vaga)", re.IGNORECASE)
+iptu_rx = re.compile(r"(IPTU[:\s]*R?\$?\s*[\d\.\,kKmM]+)", re.IGNORECASE)
+cond_rx = re.compile(r"(Condomínio|Condominio|condomínio|condominio)[:\s]*R?\$?\s*[\d\.\,kKmM]+", re.IGNORECASE)
+
+def is_probably_ad(tag: BeautifulSoup) -> bool:
+    """
+    Heurística para detectar anúncios/patrocinados: palavras em class/id/text
+    """
+    text = (tag.get_text(" ", strip=True) or "").lower()
+    class_id = " ".join(filter(None, [(" ".join(tag.get("class") or [])).lower() if tag.get("class") else "", (tag.get("id") or "").lower()]))
+    # common ad markers
+    ad_markers = ["ad", "ads", "patrocinad", "patrocinio", "promoted", "anúncio", "anuncio", "sponsored"]
+    for m in ad_markers:
+        if m in text or m in class_id:
+            return True
+    return False
+
+def find_listing_cards(soup: BeautifulSoup) -> List[BeautifulSoup]:
+    """
+    Tenta localizar os 'cards' de resultados de busca com heurísticas:
+    - elementos com classes contendo 'list', 'card', 'result', 'item', 'property', 'listing'
+    - evita containers que pareçam anúncios
+    """
+    candidates = []
+    selectors = [
+        "[class*='listing']",
+        "[class*='card']",
+        "[class*='result']",
+        "[class*='item']",
+        "[class*='property']",
+        "[class*='ad']",
+        "[class*='anuncio']",
+        "li",
+        "article",
+        "div"
+    ]
+    # Search for candidate blocks
+    for sel in selectors:
+        for el in soup.select(sel):
+            # ignore tiny elements
+            text = (el.get_text(" ", strip=True) or "")
+            if len(text) < 30:
+                continue
+            # skip obvious ads
+            if is_probably_ad(el):
+                continue
+            # ensure it's not a top-level container that contains many results (we want individual cards)
+            # heuristics: card should not have many child elements that themselves contain 200+ chars (avoid containers)
+            child_texts = [c.get_text(" ", strip=True) for c in el.find_all(recursive=False)]
+            if any(len(ct or "") > 400 for ct in child_texts):
+                # could be big container; still consider but lower priority
+                pass
+            candidates.append(el)
+    # Deduplicate by id or text snippet
+    seen = set()
+    filtered = []
+    for c in candidates:
+        key = (c.get("id") or "") + "|" + (c.get("class")[0] if c.get("class") else "") + "|" + (c.get_text(" ", strip=True)[:200])
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(c)
+    # Heuristic: many generic divs matched; keep those that have price or square meters or 'quartos'
+    final = []
+    for c in filtered:
+        t = c.get_text(" ", strip=True)
+        if money_rx.search(t) or m2_rx.search(t) or rooms_rx.search(t) or "vaga" in t.lower():
+            final.append(c)
+    # If none found by heuristics, fallback to a small set of filtered items (avoid huge containers)
+    if not final:
+        # find direct children likely to be list items under a results container
+        for container in soup.select("[class*='results'], [id*='results'], [class*='list'], [id*='list']"):
+            for li in container.find_all(["li", "article", "div"], recursive=False):
+                if is_probably_ad(li):
+                    continue
+                t = li.get_text(" ", strip=True)
+                if len(t) > 50 and (money_rx.search(t) or m2_rx.search(t) or rooms_rx.search(t)):
+                    final.append(li)
+        # as last resort, try top-level li/article
+        if not final:
+            for li in soup.find_all(["li", "article"], limit=80):
+                if is_probably_ad(li):
+                    continue
+                t = li.get_text(" ", strip=True)
+                if len(t) > 50 and (money_rx.search(t) or m2_rx.search(t) or rooms_rx.search(t)):
+                    final.append(li)
+    return final
+
+def extract_field_from_card(card, base_url) -> Dict[str, Optional[str]]:
+    """
+    Extrai heurísticamente os campos requeridos de um elemento 'card'
+    """
+    text = card.get_text(" ", strip=True) or ""
+    # link: prefer the largest anchor in the card
+    link = None
+    a_tags = card.find_all("a", href=True)
+    if a_tags:
+        # choose href of the anchor with longest text or first anchor with 'href' that looks internal/external listing
+        a_tags_sorted = sorted(a_tags, key=lambda a: len(a.get_text(" ", strip=True) or ""), reverse=True)
+        href = a_tags_sorted[0].get("href")
+        # make absolute
+        if href:
+            link = urljoin(base_url, href)
+    # endereço: try common address tags or patterns
+    address = None
+    # try find elements with aria-label or address tag
+    addr_el = card.find(["address"]) or card.find(attrs={"aria-label": re.compile(r"endereço|address|localização|localizacao", re.I)})
+    if addr_el:
+        address = first_text_or_none(addr_el)
+    if not address:
+        # heuristic: look for text with street markers (Rua, Av., Avenida, Travessa, R., Alameda)
+        m = re.search(r"((R\.|Rua|Av\.|Avenida|Travessa|Alameda|Estrada|Rodovia)\s+[^\n,]{3,80})", text, re.I)
+        if m:
+            address = m.group(1).strip()
+    # valor
+    valor = None
+    m = money_rx.search(text)
+    if m:
+        valor = m.group(0).strip()
+    # condominio
+    cond = None
+    m = cond_rx.search(text)
+    if m:
+        cond = m.group(0).split(":", 1)[-1].strip() if ":" in m.group(0) else m.group(0).strip()
+    else:
+        # try pattern "Condomínio R$ 1.000"
+        m2 = re.search(r"(Condom[ií]o[:\s]*R?\$?\s*[\d\.\,kKmM]+)", text, re.I)
+        if m2:
+            cond = m2.group(1).split(":", 1)[-1].strip()
+    # IPTU
+    iptu = None
+    m = iptu_rx.search(text)
+    if m:
+        iptu = m.group(0).split(":", 1)[-1].strip() if ":" in m.group(0) else m.group(0).strip()
+    # M2
+    m2 = None
+    m = m2_rx.search(text)
+    if m:
+        m2 = m.group(1).replace(" ", "")
+    # Quartos
+    quartos = None
+    m = rooms_rx.search(text)
+    if m:
+        quartos = m.group(1)
+    # Suites
+    suites = None
+    m = suite_rx.search(text)
+    if m:
+        suites = m.group(1)
+    # Vaga(s)
+    vagas = None
+    m = vaga_rx.search(text)
+    if m:
+        vagas = m.group(1)
+    # fallback: try dedicated spans/labels
+    # try to find element labelled "Quartos" etc.
+    def find_label_value(card, label_patterns: List[str]) -> Optional[str]:
+        for pat in label_patterns:
+            el = card.find(string=re.compile(pat, re.I))
+            if el:
+                # try next sibling or parent text
+                parent = el.parent
+                # sibling
+                sib_text = None
+                if parent:
+                    # try parent next sibling
+                    next_el = parent.find_next_sibling()
+                    if next_el:
+                        sib_text = first_text_or_none(next_el)
+                if not sib_text:
+                    # try parent text minus label
+                    pt = first_text_or_none(parent)
+                    if pt:
+                        # remove label word
+                        candidate = re.sub(pat, "", pt, flags=re.I).strip()
+                        if candidate:
+                            sib_text = candidate
+                if sib_text:
+                    return sib_text
+        return None
+
+    if not quartos:
+        q = find_label_value(card, ["quartos?", "dormit[oó]rios?", "qtos?", r"(\d)\s*quarto"])
+        if q:
+            # extract number
+            mq = re.search(r"(\d+)", q)
+            if mq:
+                quartos = mq.group(1)
+
+    if not suites:
+        s = find_label_value(card, ["su[ií]tes?", "su[ií]te", "suite"])
+        if s:
+            ms = re.search(r"(\d+)", s)
+            if ms:
+                suites = ms.group(1)
+
+    if not vagas:
+        v = find_label_value(card, ["vagas?", "vaga"])
+        if v:
+            mv = re.search(r"(\d+)", v)
+            if mv:
+                vagas = mv.group(1)
+
+    # final dictionary (normalize empty strings to None)
+    return {
+        "Endereço": address or None,
+        "Valor": valor or None,
+        "Condominio": cond or None,
+        "IPTU": iptu or None,
+        "M2": m2 or None,
+        "Quartos": quartos or None,
+        "Suites": suites or None,
+        "Vaga": vagas or None,
+        "Link": link or None
+    }
+
+def parse_listings_from_url(url: str, limit: int = 100) -> pd.DataFrame:
+    """
+    Faz download da página e tenta extrair os listings da página de resultados de busca.
+    Retorna DataFrame com as colunas solicitadas.
+    """
+    logger.info("Fetching URL for listings parse: %s", url)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; ListingsScraper/1.0)",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.exception("HTTP error fetching url")
+        raise RuntimeError(f"Falha ao baixar a URL: {e}")
+
+    content_type = resp.headers.get("Content-Type", "")
+    if "html" not in content_type.lower():
+        raise RuntimeError(f"Conteúdo não-HTML: {content_type}")
+
+    html = resp.text
+    soup = BeautifulSoup(html, "lxml")
+
+    cards = find_listing_cards(soup)
+    logger.info("Found %d candidate cards", len(cards))
+    rows = []
+    base_url = resp.url  # after redirects
+
+    count = 0
+    for card in cards:
+        if count >= limit:
+            break
+        # double-check not ad
+        if is_probably_ad(card):
+            continue
+        data = extract_field_from_card(card, base_url)
+        # require at least Valor or M2 or Link to consider valid listing
+        if any([data.get("Valor"), data.get("M2"), data.get("Link")]):
+            rows.append(data)
+            count += 1
+
+    # deduplicate by Link or (Valor+Endereço)
+    seen = set()
+    deduped = []
+    for r in rows:
+        key = (r.get("Link") or "") + "|" + (r.get("Valor") or "") + "|" + (r.get("Endereço") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+
+    df = pd.DataFrame(deduped)
+    # normalize columns order
+    expected_cols = ["Endereço", "Valor", "Condominio", "IPTU", "M2", "Quartos", "Suites", "Vaga", "Link"]
+    for c in expected_cols:
+        if c not in df.columns:
+            df[c] = None
+    df = df[expected_cols]
+    return df
+
+# =========================
+# UI: Sidebar controls
+# =========================
+with st.sidebar:
+    st.header("Configuração")
+    scrape_mode = st.radio("Tipo de extração", ["Texto completo (fallback)", "Resultados de busca (listings)"], index=1)
+    max_listings = st.number_input("Máx de listings a extrair", min_value=5, max_value=500, value=80, step=5)
+    st.markdown("---")
+    # reset button for debug
+    if st.button("Resetar estado (debug)"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.experimental_rerun()
+
+# =========================
+# Main UI
+# =========================
+st.title("🧾 Raspador de resultados de busca → Excel")
+st.markdown("Cole a URL da página de resultados de busca (ex.: página com múltiplos anúncios/listings). O scrapper tentará **extrair apenas os resultados de busca** (ignorando anúncios/patrocinados).")
+
+col1, col2 = st.columns([4, 1])
+with col1:
+    url_input = st.text_input("URL da página de busca", value=st.session_state.scrape_url or "", placeholder="https://exemplo.com/busca?q=apartamento")
+with col2:
+    run_btn = st.button("Extrair", use_container_width=True)
+
+if run_btn and url_input:
+    st.session_state.scrape_url = url_input
+    with st.spinner("Raspando página e extraindo resultados..."):
+        try:
+            if scrape_mode == "Resultados de busca (listings)":
+                df = parse_listings_from_url(url_input, limit=int(max_listings))
+                if df is None or df.empty:
+                    st.warning("Nenhum listing identificado automaticamente. Tente alternar para 'Texto completo' ou passe a URL exata da listagem.")
+                else:
+                    st.success(f"Extraídos {len(df)} resultados (após heurística).")
+                    st.session_state.scrape_df = df
+                    # show preview
+                    st.dataframe(df.head(50))
+            else:
+                # fallback to previous behavior: scrape full text (lighter)
+                from bs4 import BeautifulSoup as BS
+                resp = requests.get(url_input, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+                soup = BS(resp.text, "lxml")
+                for tag in soup(["script", "style", "noscript", "template"]):
+                    tag.decompose()
+                text = re.sub(r"\n\s*\n+", "\n\n", soup.get_text(separator="\n"))
+                st.session_state.scrape_df = None
+                st.success("Texto da página extraído (use download abaixo para salvar).")
+                with st.expander("Prévia do texto raspado"):
+                    st.write(text[:10000])
+        except Exception as e:
+            logger.exception("Erro na extração")
+            st.error(f"Falha ao extrair: {e}")
+
+# download/export area
+st.markdown("---")
+st.subheader("Exportar para Excel")
+
+def df_to_excel_bytes_for_listings(df: pd.DataFrame, sheet_name: str = "listings") -> bytes:
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
     bio.seek(0)
     return bio.read()
 
-def render_excel_download_button_in_sidebar():
-    with st.sidebar:
-        st.markdown("### Exportação")
-        df_preview = build_scrape_dataframe()
-        if df_preview is None or df_preview.empty:
-            st.caption("Nenhum conteúdo raspado disponível para exportação.")
-            return
-        parsed = urlparse(st.session_state.scrape_url or "")
-        host = (parsed.netloc or "conteudo").replace(":", "_")
-        ts_fname = datetime.now().strftime("%Y%m%d-%H%M%S")
-        fname = f"raspagem_{host}_{ts_fname}.xlsx"
-        st.download_button(
-            label="Baixar Excel da raspagem",
-            data=df_to_excel_bytes(df_preview),
-            file_name=fname,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+if st.session_state.get("scrape_df") is not None:
+    df_preview = st.session_state.scrape_df.copy()
+    st.markdown("Tabela identificada:")
+    st.dataframe(df_preview.head(100))
+    fname = f"listings_{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
+    st.download_button(
+        label="Baixar Excel (listings)",
+        data=df_to_excel_bytes_for_listings(df_preview),
+        file_name=fname,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+else:
+    st.info("Nenhum DataFrame de listings disponível. Execute uma extração de 'Resultados de busca (listings)'.")
+    st.caption("Modo alternativo: extração de texto completo está disponível mas não gera o Excel de listings automaticamente.")
 
 # =========================
-# Sidebar de Configuração
-# =========================
-with st.sidebar:
-    st.markdown("## Configurações")
-    model = st.selectbox("Modelo", AVAILABLE_MODELS, index=0, key="model_select")
-    temperature = st.slider("Temperatura", 0.0, 2.0, float(st.session_state.settings["temperature"]), 0.1)
-    max_tokens = st.number_input(
-        "Máx tokens de saída", min_value=64, max_value=4096,
-        value=int(st.session_state.settings["max_tokens"]), step=64
-    )
-    system_prompt = st.text_area(
-        "System Prompt",
-        value=st.session_state.settings["system_prompt"],
-        height=140
-    )
-
-    st.markdown("### Busca online Tavily")
-    use_tavily = st.checkbox(
-        "Ativar busca online",
-        value=bool(st.session_state.settings.get("use_tavily", True))
-    )
-    tavily_depth = st.selectbox(
-        "Profundidade", ["basic", "advanced"],
-        index=0 if st.session_state.settings.get("tavily_depth") == "basic" else 1
-    )
-    tavily_max_results = st.slider(
-        "Máx resultados", 1, 10,
-        int(st.session_state.settings.get("tavily_max_results", 5))
-    )
-
-    st.markdown("### Raspagem de HTML")
-    inject_scrape = st.checkbox(
-        "Injetar conteúdo raspado na conversa",
-        value=bool(st.session_state.settings.get("inject_scrape", True))
-    )
-    scrape_char_limit = st.slider(
-        "Limite de caracteres do texto raspado",
-        min_value=1000, max_value=20000,
-        value=int(st.session_state.settings.get("scrape_char_limit", 8000)),
-        step=500
-    )
-
-    st.markdown("---")
-    if st.button("Limpar histórico"):
-        st.session_state.history = []
-        st.success("Histórico limpo.")
-
-render_excel_download_button_in_sidebar()
-
-try:
-    cfg = AppSettings(
-        model=model,
-        temperature=temperature,
-        max_tokens=int(max_tokens),
-        system_prompt=system_prompt,
-        use_tavily=use_tavily,
-        tavily_depth=tavily_depth,  # type: ignore
-        tavily_max_results=int(tavily_max_results),
-        inject_scrape=inject_scrape,
-        scrape_char_limit=int(scrape_char_limit)
-    )
-    st.session_state.settings = cfg.dict()
-except Exception as e:
-    st.error(f"Configuração inválida: {e}")
-
-# =========================
-# Cabeçalho
-# =========================
-st.title("🧠 Meu ChatGPT com Tavily + Raspagem HTML")
-st.caption("Raspagem direta com fallback para Tavily Extract e Jina Reader. Exportação para Excel no sidebar.")
-
-# =========================
-# Utilidades de IA e Web
-# =========================
-def openai_stream_chat(messages: List[dict], model: str, temperature: float, max_tokens: int, system_prompt: str):
-    full_messages = [{"role": "system", "content": system_prompt}] + messages
-    stream = client.chat.completions.create(
-        model=model,
-        messages=full_messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stream=True
-    )
-    partial = ""
-    placeholder = st.empty()
-    for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta and getattr(delta, "content", None):
-            partial += delta.content
-            placeholder.markdown(partial)
-    return partial
-
-def tavily_search(query: str, depth: str = "basic", max_results: int = 5) -> Dict[str, Any]:
-    if not TAVILY_API_KEY:
-        return {"error": "TAVILY_API_KEY não definida em Secrets."}
-    import requests
-    url = "https://api.tavily.com/search"
-    payload = {
-        "api_key": TAVILY_API_KEY,
-        "query": query,
-        "search_depth": depth,
-        "include_images": False,
-        "include_answer": True,
-        "max_results": int(max_results)
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=45)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        logger.exception("Erro Tavily (search)")
-        return {"error": f"Erro ao consultar Tavily: {e}"}
-
-def tavily_extract(url_to_fetch: str) -> Dict[str, Any]:
-    if not TAVILY_API_KEY:
-        return {"ok": False, "title": "", "content": "", "error": "TAVILY_API_KEY não definida.", "raw": ""}
-    import requests
-    api = "https://api.tavily.com/extract"
-    payload = {"api_key": TAVILY_API_KEY, "url": url_to_fetch}
-    try:
-        resp = requests.post(api, json=payload, timeout=45)
-        raw = resp.text
-        if resp.status_code >= 400:
-            return {"ok": False, "title": "", "content": "", "error": f"HTTP {resp.status_code}: {raw[:400]}", "raw": raw}
-        data = resp.json() if raw else {}
-        title = data.get("title") or ""
-        content = data.get("content") or data.get("text") or ""
-        if not content:
-            return {"ok": False, "title": title, "content": "", "error": "Sem conteúdo retornado pela Tavily.", "raw": raw}
-        return {"ok": True, "title": title, "content": content, "error": None, "raw": raw}
-    except Exception as e:
-        logger.exception("Erro Tavily (extract)")
-        return {"ok": False, "title": "", "content": "", "error": f"Falha no Tavily Extract: {e}", "raw": ""}
-
-def jina_reader_fetch(url_to_fetch: str) -> Dict[str, Any]:
-    import requests
-    parsed = urlparse(url_to_fetch)
-    if not parsed.scheme:
-        url_to_fetch = "https://" + url_to_fetch
-        parsed = urlparse(url_to_fetch)
-    reader_url = f"https://r.jina.ai/{parsed.scheme}://{parsed.netloc}{parsed.path or ''}"
-    if parsed.query:
-        reader_url += f"?{parsed.query}"
-    try:
-        resp = requests.get(reader_url, timeout=45)
-        text = resp.text or ""
-        if resp.status_code >= 400 or not text.strip():
-            return {"ok": False, "title": "", "content": "", "error": f"Reader HTTP {resp.status_code}"}
-        return {"ok": True, "title": "", "content": text, "error": None}
-    except Exception as e:
-        logger.exception("Erro Jina Reader")
-        return {"ok": False, "title": "", "content": "", "error": f"Falha no Jina Reader: {e}"}
-
-def scrape_direct(url: str, user_agent: str = "Mozilla/5.0 (compatible; StreamlitScraper/1.0)") -> Dict[str, Any]:
-    import requests
-    from bs4 import BeautifulSoup
-    parsed = urlparse(url)
-    if not parsed.scheme:
-        url = "https://" + url
-    headers = {
-        "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,/;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "close",
-        "Upgrade-Insecure-Requests": "1",
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=45)
-        content_type = resp.headers.get("Content-Type", "")
-        status = resp.status_code
-        if status >= 400:
-            return {"ok": False, "title": "", "text": "", "error": f"HTTP {status}", "status_code": status}
-        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-            return {"ok": False, "title": "", "text": "", "error": f"Conteúdo não-HTML: {content_type}", "status_code": status}
-        try:
-            soup = BeautifulSoup(resp.text, "lxml")
-        except Exception:
-            soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "noscript", "template"]):
-            tag.decompose()
-        title = (soup.title.string if soup.title else "") or ""
-        text = normalize_whitespace(soup.get_text(separator="\n"))
-        return {"ok": True, "title": title.strip(), "text": text, "error": None, "status_code": status}
-    except Exception as e:
-        logger.exception("Erro no download direto")
-        return {"ok": False, "title": "", "text": "", "error": f"Falha ao baixar HTML: {e}", "status_code": None}
-
-def scrape_url_to_text(url: str, char_limit: int = 8000) -> Dict[str, Any]:
-    if not url or not isinstance(url, str):
-        return {"ok": False, "url": url, "title": "", "text": "", "error": "URL inválida."}
-
-    direct = scrape_direct(url)
-    if direct.get("ok"):
-        text = direct["text"]
-        if len(text) > char_limit:
-            text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
-        st.session_state.scrape_title = direct["title"]
-        return {"ok": True, "url": url, "title": direct["title"], "text": text, "error": None}
-
-    if TAVILY_API_KEY:
-        te = tavily_extract(url)
-        if te.get("ok"):
-            text = normalize_whitespace(te["content"])
-            if len(text) > char_limit:
-                text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
-            st.session_state.scrape_title = te.get("title") or ""
-            return {"ok": True, "url": url, "title": st.session_state.scrape_title or url, "text": text, "error": None}
-        else:
-            st.session_state["_last_tavily_extract_error"] = te.get("error")
-
-    jr = jina_reader_fetch(url)
-    if jr.get("ok"):
-        text = normalize_whitespace(jr["content"])
-        if len(text) > char_limit:
-            text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
-        st.session_state.scrape_title = jr.get("title") or ""
-        return {"ok": True, "url": url, "title": st.session_state.scrape_title or url, "text": text, "error": None}
-
-    return {"ok": False, "url": url, "title": "", "text": "", "error": jr.get("error") or direct.get("error") or "Falha desconhecida"}
-
-def render_history(messages: List[dict]):
-    for m in messages:
-        if m["role"] == "user":
-            with st.chat_message("user"):
-                st.markdown(m["content"])
-        else:
-            with st.chat_message("assistant"):
-                st.markdown(m["content"])
-
-def inject_web_context_if_enabled(user_msg: str) -> Optional[str]:
-    s = st.session_state.settings
-    if not s.get("use_tavily", True):
-        return None
-    data = tavily_search(
-        query=user_msg,
-        depth=s.get("tavily_depth", "basic"),
-        max_results=int(s.get("tavily_max_results", 5))
-    )
-    if "error" in data:
-        return f"(Falha ao obter contexto da web: {data['error']})"
-    return format_tavily_context(data)
-
-def format_tavily_context(data: Dict[str, Any]) -> str:
-    answer = data.get("answer") or ""
-    results = data.get("results", []) or []
-    top = results[:5]
-    lines = []
-    for i, r in enumerate(top, start=1):
-        title = r.get("title") or "Fonte"
-        url = r.get("url") or ""
-        snippet = (r.get("content") or "").strip()
-        if len(snippet) > 220:
-            snippet = snippet[:217] + "..."
-        lines.append(f"{i}. *{title}* — {snippet}\n   {url}")
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    header = f"### Contexto de pesquisa web (Tavily) — {ts}\n"
-    if answer:
-        header += f"\n*Síntese:* {answer}\n"
-    if lines:
-        header += "\n*Fontes:*\n" + "\n".join(lines)
-    else:
-        header += "\n(Nenhuma fonte relevante retornada.)"
-    return header
-
-# =========================
-# Bloco: Raspagem de HTML
-# =========================
-st.subheader("Raspagem de HTML (cole uma URL)")
-col1, col2 = st.columns([4, 1])
-with col1:
-    url_input = st.text_input(
-        "URL a raspar",
-        value=st.session_state.scrape_url,
-        placeholder="https://exemplo.com/pagina"
-    )
-with col2:
-    scrape_btn = st.button("Raspar", use_container_width=True)
-
-if scrape_btn and url_input:
-    st.session_state.scrape_url = url_input
-    with st.spinner("Extraindo conteúdo da página..."):
-        res = scrape_url_to_text(url_input, char_limit=st.session_state.settings["scrape_char_limit"])
-    if not res.get("ok"):
-        err = res.get("error") or "Falha desconhecida"
-        extra = st.session_state.pop("_last_tavily_extract_error", None)
-        if extra:
-            err += f"\n\nDetalhe Tavily Extract: {extra}"
-        st.error(f"Falha na raspagem: {err}")
-    else:
-        st.session_state.scrape_context = res["text"]
-        st.success(f"Conteúdo raspado de: {res.get('title') or res.get('url')}")
-        with st.expander("Prévia do texto raspado"):
-            st.write(res["text"])
-        st.rerun()
-
-# =========================
-# Área de chat
-# =========================
-st.markdown("---")
-render_history(st.session_state.history)
-
-user_input = st.chat_input("Digite sua mensagem...")
-if user_input:
-    st.session_state.history.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    s = st.session_state.settings
-    if s.get("inject_scrape", True) and st.session_state.scrape_context:
-        scraped_md = "### Contexto de página (raspado via URL)\n\n" + st.session_state.scrape_context
-        with st.chat_message("assistant"):
-            st.markdown(scraped_md)
-        st.session_state.history.append({"role": "assistant", "content": scraped_md})
-
-    web_ctx_md = inject_web_context_if_enabled(user_input)
-    if web_ctx_md:
-        with st.chat_message("assistant"):
-            st.markdown(web_ctx_md)
-        st.session_state.history.append({"role": "assistant", "content": f"(Contexto externo adicionado da web)\n\n{web_ctx_md}"})
-
-    with st.chat_message("assistant"):
-        try:
-            reply = openai_stream_chat(
-                messages=st.session_state.history,
-                model=s["model"],
-                temperature=s["temperature"],
-                max_tokens=s["max_tokens"],
-                system_prompt=s["system_prompt"]
-            )
-            st.session_state.history.append({"role": "assistant", "content": reply})
-        except Exception as e:
-            logger.exception("Erro ao gerar resposta")
-            st.error(f"Ocorreu um erro ao chamar o modelo: {e}")
-
-# =========================
-# Diagnóstico
+# Diagnóstico rápido
 # =========================
 with st.expander("Diagnóstico técnico"):
-    s = st.session_state.settings
-    st.json(
-        {
-            "model": s["model"],
-            "temperature": s["temperature"],
-            "max_tokens": s["max_tokens"],
-            "history_len": len(st.session_state.history),
-            "use_tavily": s["use_tavily"],
-            "tavily_depth": s["tavily_depth"],
-            "tavily_max_results": s["tavily_max_results"],
-            "inject_scrape": s["inject_scrape"],
-            "scrape_char_limit": s["scrape_char_limit"],
-            "tem_scrape_context": bool(st.session_state.scrape_context),
-            "streamlit_cloud_ready": True
-        }
-    )
+    st.json({
+        "scrape_url": st.session_state.get("scrape_url"),
+        "has_listings_df": bool(st.session_state.get("scrape_df") is not None),
+        "scrape_mode": scrape_mode,
+    })
 
-st.caption(
-    "Secrets necessários: OPENAI_API_KEY e (opcional) TAVILY_API_KEY. "
-    "Nenhuma chave é armazenada no código."
-)
+st.caption("Heurísticas: o scraper tenta extrair campos principais dos cards de resultados e ignorar anúncios/patrocinados. Para alta precisão, informar domínio específico para ajuste fino.")
 
 

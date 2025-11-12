@@ -1,32 +1,28 @@
 # streamlit_app.py
 import os
 import re
-import json
 import logging
 from io import BytesIO
-from urllib.parse import urlparse
-from typing import List, Literal, Optional, Dict, Any
+from urllib.parse import urljoin, urlparse
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 
 import streamlit as st
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, PositiveInt, validator
 
-# =========================
-# Configuração básica
-# =========================
-st.set_page_config(
-    page_title="Meu ChatGPT + Web (Tavily) + Raspagem HTML",
-    page_icon="🧠",
-    layout="centered"
-)
-
+# -------------------------
+# Config
+# -------------------------
+st.set_page_config(page_title="Raspador de Anúncios Imobiliários", page_icon="🏠", layout="wide")
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("chatgpt-web-scraper-app")
+logger = logging.getLogger("real-estate-scraper")
 
-# =========================
-# Secrets seguros
-# =========================
+# -------------------------
+# Secrets (OpenAI optional)
+# -------------------------
 def get_secret(name: str) -> Optional[str]:
     try:
         return st.secrets.get(name, None)
@@ -36,550 +32,314 @@ def get_secret(name: str) -> Optional[str]:
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
 
-if not OPENAI_API_KEY:
-    st.error("Defina OPENAI_API_KEY em Secrets antes de usar.")
-    st.stop()
-
-# =========================
-# Inicialização robusta do cliente OpenAI (API moderna)
-# =========================
-# Observação: a API moderna requer 'openai>=1.0.0' e httpx instalado no ambiente.
-# Se a inicialização falhar, mostramos instruções claras para o deploy.
-_openai_client_mode = None
-client = None
-try:
-    # import correto para openai moderno
-    from openai import OpenAI as _OpenAIClass  # type: ignore
-    # garantir a variável de ambiente (alguns clientes a leem)
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-    # instanciar client passando a chave explicitamente
-    try:
-        client = _OpenAIClass(api_key=OPENAI_API_KEY)
-        _openai_client_mode = "modern-explicit"
-    except TypeError:
-        # fallback: set api_key on module and instantiate without param
-        import openai as _openai_module_for_env  # type: ignore
-        _openai_module_for_env.api_key = OPENAI_API_KEY
-        client = _OpenAIClass()
-        _openai_client_mode = "modern-env"
-except Exception as e_modern:
-    # Se falhar, exibir erro instrutivo (muitas vezes falta httpx).
-    logger.exception("Falha ao inicializar OpenAI moderno")
-    st.error(
-        "Falha ao inicializar cliente OpenAI moderno. "
-        "Provavelmente falta a dependência 'httpx' no ambiente do Streamlit Cloud.\n\n"
-        "Ação recomendada: adicione `httpx==0.24.1` ao requirements.txt e redeploy.\n\n"
-        f"Detalhe técnico: {e_modern}"
-    )
-    st.stop()
-
-logger.info(f"OpenAI client mode: {_openai_client_mode}")
-
-# =========================
-# Modelos e validação
-# =========================
-AVAILABLE_MODELS = [
-    "gpt-4o-mini",
-    "gpt-4o",
-    "gpt-4.1-mini",
-    "gpt-4.1"
-]
-
+# -------------------------
+# App settings model (keeps previous pattern)
+# -------------------------
 class AppSettings(BaseModel):
-    model: Literal["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"] = Field(default="gpt-4o-mini")
-    temperature: float = Field(default=0.3, ge=0.0, le=2.0)
-    max_tokens: PositiveInt = Field(default=1024)
-    system_prompt: str = Field(
-        default=(
-            "Você é um assistente de IA útil, objetivo e seguro. "
-            "Responda em português do Brasil, de forma clara e prática."
-        )
-    )
-    use_tavily: bool = Field(default=True)
-    tavily_depth: Literal["basic", "advanced"] = Field(default="basic")
-    tavily_max_results: PositiveInt = Field(default=5)
-    inject_scrape: bool = Field(default=True)
-    scrape_char_limit: PositiveInt = Field(default=8000)
+    max_listing_links: PositiveInt = Field(default=30)
+    timeout_sec: PositiveInt = Field(default=15)
 
-    @validator("max_tokens")
-    def clamp_max_tokens(cls, v):
-        return min(v, 4096)
+    @validator("max_listing_links")
+    def clamp_max_links(cls, v):
+        return min(v, 200)
 
-# =========================
-# Estado da sessão
-# =========================
-if "history" not in st.session_state:
-    st.session_state.history = []
 if "settings" not in st.session_state:
     st.session_state.settings = AppSettings().dict()
-if "scrape_context" not in st.session_state:
-    st.session_state.scrape_context = ""
-if "scrape_url" not in st.session_state:
-    st.session_state.scrape_url = ""
-if "scrape_title" not in st.session_state:
-    st.session_state.scrape_title = ""
 
-# =========================
-# Utilidades comuns
-# =========================
-def normalize_whitespace(text: str) -> str:
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
-    return text.strip()
+# -------------------------
+# Utils: fetching and parsing
+# -------------------------
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; StreamlitScraper/1.0)",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 
-def build_scrape_dataframe() -> Optional[pd.DataFrame]:
-    txt = (st.session_state.scrape_context or "").strip()
-    url = st.session_state.scrape_url or ""
-    title = st.session_state.scrape_title or ""
-    if not txt:
+def safe_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        resp.raise_for_status()
+        return resp
+    except Exception as e:
+        logger.debug(f"safe_get failed {url}: {e}")
         return None
-    # separa por parágrafos em blocos não vazios
-    parts = [p.strip() for p in re.split(r"\n{2,}", txt) if p.strip()]
-    rows = []
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    for i, p in enumerate(parts, start=1):
-        rows.append(
-            {
-                "timestamp_utc": ts,
-                "url": url,
-                "title": title,
-                "paragraph_index": i,
-                "paragraph_length": len(p),
-                "text": p,
-            }
-        )
-    return pd.DataFrame(rows)
 
-def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "scrape") -> bytes:
+def extract_jsonld(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    out = []
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = tag.string
+            if not data:
+                continue
+            parsed = re.sub(r"^\s+|\s+$", "", data)
+            obj = __import__("json").loads(parsed)
+            # can be list or dict
+            if isinstance(obj, list):
+                out.extend(obj)
+            else:
+                out.append(obj)
+        except Exception:
+            continue
+    return out
+
+# Heuristics to find price, area, etc.
+RE_PRICE = re.compile(r"(R\$\s?[\d\.,]+)", re.I)
+RE_CONDOM = re.compile(r"(condom[ií]nio[:\s]*R?\$?\s*[\d\.,]+)", re.I)
+RE_IPTU = re.compile(r"(iptu[:\s]*R?\$?\s*[\d\.,]+)", re.I)
+RE_AREA = re.compile(r"(\d{1,4}(?:[.,]\d{1,2})?)\s*(m²|m2|m²)", re.I)
+RE_ROOM = re.compile(r"(\d+)\s*(?:quartos|quarto)\b", re.I)
+RE_SUITE = re.compile(r"(\d+)\s*(?:su[ií]tes|su[ií]te|suite)\b", re.I)
+RE_VAGA = re.compile(r"(\d+)\s*(?:vagas|vaga)\b", re.I)
+RE_ADDRESS_LABEL = re.compile(r"end[eé]re[cç]o[:\s]*([^\n\r]+)", re.I)
+
+def text_first_matching(regex: re.Pattern, text: str) -> Optional[str]:
+    m = regex.search(text)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def clean_money(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    # keep like R$ 1.234,56
+    return raw.strip()
+
+def parse_listing_page(url: str, timeout: int = 15) -> Dict[str, Any]:
+    """
+    Fetch a single listing page and attempt to extract the requested fields.
+    """
+    logger.info(f"Parsing listing: {url}")
+    res = {"Link": url, "Endereço": None, "Valor": None, "Condominio": None, "IPTU": None,
+           "M2": None, "Quartos": None, "Suites": None, "vaga": None, "raw_text": ""}
+    resp = safe_get(url, timeout=timeout)
+    if resp is None:
+        res["raw_text"] = ""
+        return res
+
+    html = resp.text
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(separator="\n", strip=True)
+    res["raw_text"] = text[:1000]  # small preview for debug
+
+    # 1) Try JSON-LD structured data for address/price/area
+    try:
+        jsonld = extract_jsonld(soup)
+        for obj in jsonld:
+            if isinstance(obj, dict):
+                # common keys: offers.price, address, areaServed, numberOfRooms, floorSize
+                offers = obj.get("offers") or obj.get("mainEntityOfPage") or {}
+                if isinstance(offers, dict):
+                    price = offers.get("price") or offers.get("priceSpecification", {}).get("price")
+                    if price and not res["Valor"]:
+                        # price could be numeric
+                        res["Valor"] = f"R$ {price}" if isinstance(price, (int, float)) else str(price)
+                addr = obj.get("address") or obj.get("location") or (obj.get("mainEntityOfPage") or {}).get("address")
+                if addr and not res["Endereço"]:
+                    if isinstance(addr, dict):
+                        # build address string if structured
+                        parts = []
+                        for k in ("streetAddress", "addressLocality", "addressRegion", "postalCode"):
+                            v = addr.get(k)
+                            if v:
+                                parts.append(str(v))
+                        if parts:
+                            res["Endereço"] = ", ".join(parts)
+                    elif isinstance(addr, str):
+                        res["Endereço"] = addr
+                # floorSize or area
+                area = obj.get("floorSize") or obj.get("area") or obj.get("floorArea")
+                if isinstance(area, dict):
+                    v = area.get("value") or area.get("name")
+                    if v and not res["M2"]:
+                        res["M2"] = str(v)
+                elif area and not res["M2"]:
+                    res["M2"] = str(area)
+                # rooms
+                rooms = obj.get("numberOfRooms") or obj.get("numRooms")
+                if rooms and not res["Quartos"]:
+                    res["Quartos"] = str(rooms)
+                suites = obj.get("numberOfBedrooms") or obj.get("numberOfSuites")
+                if suites and not res["Suites"]:
+                    res["Suites"] = str(suites)
+    except Exception:
+        logger.debug("JSON-LD parse failed", exc_info=True)
+
+    # 2) Regex fallback on visible text
+    if not res["Valor"]:
+        p = text_first_matching(RE_PRICE, text)
+        res["Valor"] = clean_money(p)
+    if not res["Condominio"]:
+        c = text_first_matching(RE_CONDOM, text)
+        res["Condominio"] = clean_money(c)
+    if not res["IPTU"]:
+        i = text_first_matching(RE_IPTU, text)
+        res["IPTU"] = clean_money(i)
+    if not res["M2"]:
+        a = text_first_matching(RE_AREA, text)
+        res["M2"] = a
+    if not res["Quartos"]:
+        q = text_first_matching(RE_ROOM, text)
+        res["Quartos"] = q
+    if not res["Suites"]:
+        s = text_first_matching(RE_SUITE, text)
+        res["Suites"] = s
+    if not res["vaga"]:
+        v = text_first_matching(RE_VAGA, text)
+        res["vaga"] = v
+
+    # 3) Try to detect address labels near DOM elements
+    if not res["Endereço"]:
+        # common tags: <address>, or label 'Endereço' in nearby elements
+        addr_tag = soup.find("address")
+        if addr_tag and addr_tag.get_text(strip=True):
+            res["Endereço"] = addr_tag.get_text(" ", strip=True)
+
+    if not res["Endereço"]:
+        # look for "Endereço" label in page: lines where 'Endereço' appears
+        m = RE_ADDRESS_LABEL.search(text)
+        if m:
+            res["Endereço"] = m.group(1).strip()
+
+    # 4) If still empty, try to extract from title/meta
+    if not res["Endereço"]:
+        title = soup.title.string if soup.title else None
+        if title:
+            # sometimes title contains neighborhood / address
+            res["Endereço"] = title.strip()
+
+    # Normalize some fields (strip repeated whitespace)
+    for k in ["Endereço", "Valor", "Condominio", "IPTU", "M2", "Quartos", "Suites", "vaga"]:
+        if res.get(k) and isinstance(res[k], str):
+            res[k] = re.sub(r"\s+", " ", res[k]).strip()
+
+    return res
+
+def gather_listing_links(listings_page: str, max_links: int = 50, timeout: int = 15) -> List[str]:
+    """
+    From a page of listings, collect candidate links to individual ads.
+    Heuristics: anchor hrefs that contain keywords or look like internal listing pages.
+    """
+    resp = safe_get(listings_page, timeout=timeout)
+    if resp is None:
+        return []
+    base = resp.url
+    soup = BeautifulSoup(resp.text, "lxml")
+    anchors = soup.find_all("a", href=True)
+    links = []
+    seen = set()
+    keywords = ["imovel", "imóvel", "anuncio", "anúncio", "apartamento", "venda", "aluguel", "detalhes", "property"]
+    for a in anchors:
+        href = a["href"].strip()
+        if href.startswith("#") or href.lower().startswith("javascript"):
+            continue
+        full = urljoin(base, href)
+        parsed = urlparse(full)
+        # exclude external domains? allow same domain or common listing patterns
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if full in seen:
+            continue
+        # Heuristic: if anchor text or href contains a keyword, consider it
+        anchor_text = (a.get_text(" ", strip=True) or "").lower()
+        lower_href = href.lower()
+        if any(k in anchor_text for k in keywords) or any(k in lower_href for k in keywords):
+            links.append(full)
+            seen.add(full)
+        else:
+            # also include links that look like detail pages: long path with digits
+            if re.search(r"/\d{3,}", parsed.path):
+                links.append(full)
+                seen.add(full)
+        if len(links) >= max_links:
+            break
+    return links
+
+# -------------------------
+# Excel helper
+# -------------------------
+def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "listings") -> bytes:
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
     bio.seek(0)
     return bio.read()
 
-def render_excel_download_button_in_sidebar():
-    """Cria (ou atualiza) o botão de download no sidebar conforme o estado atual."""
-    with st.sidebar:
-        st.markdown("### Exportação")
-        df_preview = build_scrape_dataframe()
-        if df_preview is None or df_preview.empty:
-            st.caption("Nenhum conteúdo raspado disponível para exportação.")
-            return
-        parsed = urlparse(st.session_state.scrape_url or "")
-        host = (parsed.netloc or "conteudo").replace(":", "_")
-        ts_fname = datetime.now().strftime("%Y%m%d-%H%M%S")
-        fname = f"raspagem_{host}_{ts_fname}.xlsx"
-        st.download_button(
-            label="Baixar Excel da raspagem",
-            data=df_to_excel_bytes(df_preview),
-            file_name=fname,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
-
-# =========================
-# Sidebar de Configuração
-# =========================
-with st.sidebar:
-    st.markdown("## Configurações")
-    model = st.selectbox("Modelo", AVAILABLE_MODELS, index=0, key="model_select")
-    temperature = st.slider("Temperatura", 0.0, 2.0, float(st.session_state.settings["temperature"]), 0.1)
-    max_tokens = st.number_input(
-        "Máx tokens de saída", min_value=64, max_value=4096,
-        value=int(st.session_state.settings["max_tokens"]), step=64
-    )
-    system_prompt = st.text_area(
-        "System Prompt",
-        value=st.session_state.settings["system_prompt"],
-        height=140
-    )
-
-    st.markdown("### Busca online Tavily")
-    use_tavily = st.checkbox(
-        "Ativar busca online",
-        value=bool(st.session_state.settings.get("use_tavily", True))
-    )
-    tavily_depth = st.selectbox(
-        "Profundidade", ["basic", "advanced"],
-        index=0 if st.session_state.settings.get("tavily_depth") == "basic" else 1
-    )
-    tavily_max_results = st.slider(
-        "Máx resultados", 1, 10,
-        int(st.session_state.settings.get("tavily_max_results", 5))
-    )
-
-    st.markdown("### Raspagem de HTML")
-    inject_scrape = st.checkbox(
-        "Injetar conteúdo raspado na conversa",
-        value=bool(st.session_state.settings.get("inject_scrape", True))
-    )
-    scrape_char_limit = st.slider(
-        "Limite de caracteres do texto raspado",
-        min_value=1000, max_value=20000,
-        value=int(st.session_state.settings.get("scrape_char_limit", 8000)),
-        step=500
-    )
-
-    # Botão de limpar histórico
-    st.markdown("---")
-    if st.button("Limpar histórico"):
-        st.session_state.history = []
-        st.success("Histórico limpo.")
-
-# cria/atualiza o botão de download com o estado atual
-render_excel_download_button_in_sidebar()
-
-# Atualiza objeto de configuração validado (fora do with para evitar conflitos de estado)
-try:
-    cfg = AppSettings(
-        model=model,
-        temperature=temperature,
-        max_tokens=int(max_tokens),
-        system_prompt=system_prompt,
-        use_tavily=use_tavily,
-        tavily_depth=tavily_depth,  # type: ignore
-        tavily_max_results=int(tavily_max_results),
-        inject_scrape=inject_scrape,
-        scrape_char_limit=int(scrape_char_limit)
-    )
-    st.session_state.settings = cfg.dict()
-except Exception as e:
-    st.error(f"Configuração inválida: {e}")
-
-# =========================
-# Cabeçalho
-# =========================
-st.title("🧠 Meu ChatGPT com Tavily + Raspagem HTML")
-st.caption("Raspagem direta com fallback para Tavily Extract e Jina Reader. Exportação para Excel no sidebar.")
-
-# =========================
-# Utilidades de IA e Web (usando API moderna)
-# =========================
-def openai_stream_chat(messages: List[dict], model: str, temperature: float, max_tokens: int, system_prompt: str):
-    """
-    Usa a API moderna: client.chat.completions.create(..., stream=True)
-    client é instância de openai.OpenAI()
-    """
-    full_messages = [{"role": "system", "content": system_prompt}] + messages
-
-    try:
-        stream = client.chat.completions.create(
-            model=model,
-            messages=full_messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True
-        )
-    except Exception as e:
-        logger.exception("Erro ao iniciar stream OpenAI (moderno)")
-        raise
-
-    partial = ""
-    placeholder = st.empty()
-
-    # Itera sobre chunks que podem ser objetos com attribute .choices[...]...
-    for chunk in stream:
-        content_piece = None
-        try:
-            # chunk pode ser objeto; extrair de forma resiliente
-            choice0 = chunk.choices[0]
-            delta = getattr(choice0, "delta", None)
-            if isinstance(delta, dict):
-                content_piece = delta.get("content") or delta.get("text")
-            else:
-                content_piece = getattr(delta, "content", None) if delta is not None else None
-        except Exception:
-            # tenta extrair via dict-like (fallback)
-            try:
-                chunk_d = dict(chunk)
-                choices = chunk_d.get("choices", [])
-                if choices:
-                    delta = choices[0].get("delta", {})
-                    content_piece = delta.get("content") or delta.get("text")
-            except Exception:
-                content_piece = None
-
-        if content_piece:
-            partial += content_piece
-            placeholder.markdown(partial)
-
-    return partial
-
-def tavily_search(query: str, depth: str = "basic", max_results: int = 5) -> Dict[str, Any]:
-    if not TAVILY_API_KEY:
-        return {"error": "TAVILY_API_KEY não definida em Secrets."}
-    import requests
-    url = "https://api.tavily.com/search"
-    payload = {
-        "api_key": TAVILY_API_KEY,
-        "query": query,
-        "search_depth": depth,
-        "include_images": False,
-        "include_answer": True,
-        "max_results": int(max_results)
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=45)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        logger.exception("Erro Tavily (search)")
-        return {"error": f"Erro ao consultar Tavily: {e}"}
-
-def tavily_extract(url_to_fetch: str) -> Dict[str, Any]:
-    if not TAVILY_API_KEY:
-        return {"ok": False, "title": "", "content": "", "error": "TAVILY_API_KEY não definida.", "raw": ""}
-    import requests
-    api = "https://api.tavily.com/extract"
-    payload = {"api_key": TAVILY_API_KEY, "url": url_to_fetch}
-    try:
-        resp = requests.post(api, json=payload, timeout=45)
-        raw = resp.text
-        if resp.status_code >= 400:
-            return {"ok": False, "title": "", "content": "", "error": f"HTTP {resp.status_code}: {raw[:400]}", "raw": raw}
-        data = resp.json() if raw else {}
-        title = data.get("title") or ""
-        content = data.get("content") or data.get("text") or ""
-        if not content:
-            return {"ok": False, "title": title, "content": "", "error": "Sem conteúdo retornado pela Tavily.", "raw": raw}
-        return {"ok": True, "title": title, "content": content, "error": None, "raw": raw}
-    except Exception as e:
-        logger.exception("Erro Tavily (extract)")
-        return {"ok": False, "title": "", "content": "", "error": f"Falha no Tavily Extract: {e}", "raw": ""}
-
-def jina_reader_fetch(url_to_fetch: str) -> Dict[str, Any]:
-    import requests
-    parsed = urlparse(url_to_fetch)
-    if not parsed.scheme:
-        url_to_fetch = "https://" + url_to_fetch
-        parsed = urlparse(url_to_fetch)
-    reader_url = f"https://r.jina.ai/{parsed.scheme}://{parsed.netloc}{parsed.path or ''}"
-    if parsed.query:
-        reader_url += f"?{parsed.query}"
-    try:
-        resp = requests.get(reader_url, timeout=45)
-        text = resp.text or ""
-        if resp.status_code >= 400 or not text.strip():
-            return {"ok": False, "title": "", "content": "", "error": f"Reader HTTP {resp.status_code}"}
-        return {"ok": True, "title": "", "content": text, "error": None}
-    except Exception as e:
-        logger.exception("Erro Jina Reader")
-        return {"ok": False, "title": "", "content": "", "error": f"Falha no Jina Reader: {e}"}
-
-def scrape_direct(url: str, user_agent: str = "Mozilla/5.0 (compatible; StreamlitScraper/1.0)") -> Dict[str, Any]:
-    import requests
-    from bs4 import BeautifulSoup
-    parsed = urlparse(url)
-    if not parsed.scheme:
-        url = "https://" + url
-    headers = {
-        "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,/;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "close",
-        "Upgrade-Insecure-Requests": "1",
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=45)
-        content_type = resp.headers.get("Content-Type", "")
-        status = resp.status_code
-        if status >= 400:
-            return {"ok": False, "title": "", "text": "", "error": f"HTTP {status}", "status_code": status}
-        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-            return {"ok": False, "title": "", "text": "", "error": f"Conteúdo não-HTML: {content_type}", "status_code": status}
-        try:
-            soup = BeautifulSoup(resp.text, "lxml")
-        except Exception:
-            soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "noscript", "template"]):
-            tag.decompose()
-        title = (soup.title.string if soup.title else "") or ""
-        text = normalize_whitespace(soup.get_text(separator="\n"))
-        return {"ok": True, "title": title.strip(), "text": text, "error": None, "status_code": status}
-    except Exception as e:
-        logger.exception("Erro no download direto")
-        return {"ok": False, "title": "", "text": "", "error": f"Falha ao baixar HTML: {e}", "status_code": None}
-
-def scrape_url_to_text(url: str, char_limit: int = 8000) -> Dict[str, Any]:
-    """
-    Estratégia em camadas:
-      1) Direto
-      2) Tavily Extract (se chave)
-      3) Jina Reader
-    """
-    if not url or not isinstance(url, str):
-        return {"ok": False, "url": url, "title": "", "text": "", "error": "URL inválida."}
-
-    direct = scrape_direct(url)
-    if direct.get("ok"):
-        text = direct["text"]
-        if len(text) > char_limit:
-            text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
-        st.session_state.scrape_title = direct["title"]
-        return {"ok": True, "url": url, "title": direct["title"], "text": text, "error": None}
-
-    if TAVILY_API_KEY:
-        te = tavily_extract(url)
-        if te.get("ok"):
-            text = normalize_whitespace(te["content"])
-            if len(text) > char_limit:
-                text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
-            st.session_state.scrape_title = te.get("title") or ""
-            return {"ok": True, "url": url, "title": st.session_state.scrape_title or url, "text": text, "error": None}
-        else:
-            st.session_state["_last_tavily_extract_error"] = te.get("error")
-
-    jr = jina_reader_fetch(url)
-    if jr.get("ok"):
-        text = normalize_whitespace(jr["content"])
-        if len(text) > char_limit:
-            text = text[:char_limit] + "\n\n[...conteúdo truncado…]"
-        st.session_state.scrape_title = jr.get("title") or ""
-        return {"ok": True, "url": url, "title": st.session_state.scrape_title or url, "text": text, "error": None}
-
-    return {"ok": False, "url": url, "title": "", "text": "", "error": jr.get("error") or direct.get("error") or "Falha desconhecida"}
-
-def render_history(messages: List[dict]):
-    for m in messages:
-        if m["role"] == "user":
-            with st.chat_message("user"):
-                st.markdown(m["content"])
-        else:
-            with st.chat_message("assistant"):
-                st.markdown(m["content"])
-
-def inject_web_context_if_enabled(user_msg: str) -> Optional[str]:
-    s = st.session_state.settings
-    if not s.get("use_tavily", True):
-        return None
-    data = tavily_search(
-        query=user_msg,
-        depth=s.get("tavily_depth", "basic"),
-        max_results=int(s.get("tavily_max_results", 5))
-    )
-    if "error" in data:
-        return f"(Falha ao obter contexto da web: {data['error']})"
-    return format_tavily_context(data)
-
-def format_tavily_context(data: Dict[str, Any]) -> str:
-    answer = data.get("answer") or ""
-    results = data.get("results", []) or []
-    top = results[:5]
-    lines = []
-    for i, r in enumerate(top, start=1):
-        title = r.get("title") or "Fonte"
-        url = r.get("url") or ""
-        snippet = (r.get("content") or "").strip()
-        if len(snippet) > 220:
-            snippet = snippet[:217] + "..."
-        lines.append(f"{i}. *{title}* — {snippet}\n   {url}")
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    header = f"### Contexto de pesquisa web (Tavily) — {ts}\n"
-    if answer:
-        header += f"\n*Síntese:* {answer}\n"
-    if lines:
-        header += "\n*Fontes:*\n" + "\n".join(lines)
-    else:
-        header += "\n(Nenhuma fonte relevante retornada.)"
-    return header
-
-# =========================
-# Bloco: Raspagem de HTML
-# =========================
-st.subheader("Raspagem de HTML (cole uma URL)")
-col1, col2 = st.columns([4, 1])
-with col1:
-    url_input = st.text_input(
-        "URL a raspar",
-        value=st.session_state.scrape_url,
-        placeholder="https://exemplo.com/pagina"
-    )
-with col2:
-    scrape_btn = st.button("Raspar", use_container_width=True)
-
-if scrape_btn and url_input:
-    st.session_state.scrape_url = url_input
-    with st.spinner("Extraindo conteúdo da página..."):
-        res = scrape_url_to_text(url_input, char_limit=st.session_state.settings["scrape_char_limit"])
-    if not res.get("ok"):
-        err = res.get("error") or "Falha desconhecida"
-        extra = st.session_state.pop("_last_tavily_extract_error", None)
-        if extra:
-            err += f"\n\nDetalhe Tavily Extract: {extra}"
-        st.error(f"Falha na raspagem: {err}")
-    else:
-        st.session_state.scrape_context = res["text"]
-        st.success(f"Conteúdo raspado de: {res.get('title') or res.get('url')}")
-        with st.expander("Prévia do texto raspado"):
-            st.write(res["text"])
-        # 👉 Garante que o sidebar se atualize já com o conteúdo raspado
-        st.rerun()
-
-# =========================
-# Área de chat
-# =========================
-st.markdown("---")
-render_history(st.session_state.history)
-
-user_input = st.chat_input("Digite sua mensagem...")
-if user_input:
-    st.session_state.history.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    s = st.session_state.settings
-    if s.get("inject_scrape", True) and st.session_state.scrape_context:
-        scraped_md = "### Contexto de página (raspado via URL)\n\n" + st.session_state.scrape_context
-        with st.chat_message("assistant"):
-            st.markdown(scraped_md)
-        st.session_state.history.append({"role": "assistant", "content": scraped_md})
-
-    web_ctx_md = inject_web_context_if_enabled(user_input)
-    if web_ctx_md:
-        with st.chat_message("assistant"):
-            st.markdown(web_ctx_md)
-        st.session_state.history.append({"role": "assistant", "content": f"(Contexto externo adicionado da web)\n\n{web_ctx_md}"})
-
-    with st.chat_message("assistant"):
-        try:
-            reply = openai_stream_chat(
-                messages=st.session_state.history,
-                model=s["model"],
-                temperature=s["temperature"],
-                max_tokens=s["max_tokens"],
-                system_prompt=s["system_prompt"]
-            )
-            st.session_state.history.append({"role": "assistant", "content": reply})
-        except Exception as e:
-            logger.exception("Erro ao gerar resposta")
-            st.error(f"Ocorreu um erro ao chamar o modelo: {e}")
-
-# =========================
-# Diagnóstico
-# =========================
-with st.expander("Diagnóstico técnico"):
-    s = st.session_state.settings
-    st.json(
-        {
-            "model": s["model"],
-            "temperature": s["temperature"],
-            "max_tokens": s["max_tokens"],
-            "history_len": len(st.session_state.history),
-            "use_tavily": s["use_tavily"],
-            "tavily_depth": s["tavily_depth"],
-            "tavily_max_results": s["tavily_max_results"],
-            "inject_scrape": s["inject_scrape"],
-            "scrape_char_limit": s["scrape_char_limit"],
-            "tem_scrape_context": bool(st.session_state.scrape_context),
-            "streamlit_cloud_ready": True,
-            "openai_client_mode": _openai_client_mode
-        }
-    )
-
-st.caption(
-    "Secrets necessários: OPENAI_API_KEY e (opcional) TAVILY_API_KEY. "
-    "Nenhuma chave é armazenada no código."
+# -------------------------
+# UI
+# -------------------------
+st.title("🏠 Raspador de Anúncios Imobiliários — Extração Estruturada")
+st.markdown(
+    "Cole abaixo a **URL da página de listagens** (por exemplo: resultado de busca de um site de imóveis). "
+    "O app tentará acessar cada anúncio e extrair Endereço, Valor, Condomínio, IPTU, M2, Quartos, Suítes, Vaga e Link."
 )
 
+col1, col2 = st.columns([3,1])
+with col1:
+    listings_url = st.text_input("URL da página de listagens", value=st.session_state.get("last_listings_url",""))
+    max_links = st.number_input("Máx de anúncios a seguir", min_value=1, max_value=200, value=int(st.session_state.settings["max_listing_links"]))
+    timeout_sec = st.number_input("Timeout (s) por requisição", min_value=5, max_value=60, value=int(st.session_state.settings["timeout_sec"]))
+with col2:
+    run_btn = st.button("Raspar anúncios (extrair campos)")
+    clear_btn = st.button("Limpar resultados")
+
+if clear_btn:
+    st.session_state.pop("listings_df", None)
+    st.success("Resultados limpos.")
+
+if run_btn:
+    if not listings_url:
+        st.error("Cole a URL da página de listagens antes de rodar.")
+    else:
+        st.session_state["last_listings_url"] = listings_url
+        with st.spinner("Coletando links de anúncios..."):
+            links = gather_listing_links(listings_url, max_links=max_links, timeout=timeout_sec)
+        if not links:
+            st.warning("Nenhum link de anúncio encontrado com heurística padrão — verifique a URL ou aumente o máx de links.")
+        else:
+            st.info(f"{len(links)} links de anúncio coletados — iniciando extração (máx {max_links}).")
+            results = []
+            progress_bar = st.progress(0)
+            for i, link in enumerate(links[:max_links], start=1):
+                parsed = parse_listing_page(link, timeout=timeout_sec)
+                results.append(parsed)
+                progress_bar.progress(int(i/len(links) * 100))
+            progress_bar.empty()
+            if results:
+                df = pd.DataFrame(results).drop(columns=["raw_text"], errors="ignore")
+                # Reorder columns to the desired order
+                cols = ["Endereço","Valor","Condominio","IPTU","M2","Quartos","Suites","vaga","Link"]
+                for c in cols:
+                    if c not in df.columns:
+                        df[c] = None
+                df = df[cols]
+                st.session_state["listings_df"] = df
+                st.success(f"Extração concluída: {len(df)} anúncios.")
+            else:
+                st.warning("Nenhum dado extraído.")
+
+# Show results if present
+if st.session_state.get("listings_df") is not None:
+    df_out: pd.DataFrame = st.session_state["listings_df"]
+    st.markdown("### Resultados (pré-visualização)")
+    st.dataframe(df_out.head(200))
+
+    # Download button
+    excel_bytes = df_to_excel_bytes(df_out)
+    ts_fname = datetime.now().strftime("%Y%m%d-%H%M%S")
+    fname = f"anuncios_raspados_{ts_fname}.xlsx"
+    st.download_button("Baixar Excel com anúncios", data=excel_bytes, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# Diagnostics / tips
+with st.expander("Diagnóstico e dicas"):
+    st.write("Dicas para melhorar extração:")
+    st.write("- Alguns sites usam JS pesado ou carregam conteúdo dinamicamente; nesses casos a raspagem HTML direta pode não trazer todos os dados.")
+    st.write("- Ajuste palavras-chave em `gather_listing_links` se o seu site tem padrões diferentes nos URLs.")
+    st.write("- Se quiser, me diga 1 exemplo de URL (um anúncio) que você quer extrair e eu adapto os seletores para ficar 100% preciso.")
+    st.write("")
+    st.write("Config atual:")
+    st.json({
+        "last_listings_url": st.session_state.get("last_listings_url",""),
+        "max_listing_links": int(max_links),
+        "timeout_sec": int(timeout_sec),
+    })
+
+st.caption("Esse scraper usa heurísticas; é normal precisar ajustar para sites específicos — posso adaptar os padrões se você me enviar uma URL de exemplo.")

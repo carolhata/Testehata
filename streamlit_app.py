@@ -1,5 +1,5 @@
 # streamlit_app.py
-# QuintoAndar scraper — JSON-first optimized, diagnostics and optional detail-page enrichment (5 items)
+# QuintoAndar scraper — JSON-first optimized + stricter filtering for true listings
 import re
 import json
 import logging
@@ -12,7 +12,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qs, urlencode
 import streamlit as st
 
 # set_page_config MUST be first Streamlit command
-st.set_page_config(page_title="QuintoAndar → Listings → Excel (optimized)", page_icon="🏘️", layout="centered")
+st.set_page_config(page_title="QuintoAndar → Listings → Excel (filtered)", page_icon="🏘️", layout="centered")
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,7 +20,7 @@ import pandas as pd
 from pydantic import BaseModel, Field, PositiveInt
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("qa-listings-scraper-opt")
+logger = logging.getLogger("qa-listings-scraper-filtered")
 
 # -------------------------
 # App settings & session
@@ -46,12 +46,15 @@ if "last_raw_sample" not in st.session_state:
     st.session_state.last_raw_sample = None
 if "json_keys_sample" not in st.session_state:
     st.session_state.json_keys_sample = None
+if "diagnostic_counts" not in st.session_state:
+    st.session_state.diagnostic_counts = {}
 
 # -------------------------
 # Normalizers / helpers
 # -------------------------
 money_rx = re.compile(r"[Rr]\$?\s*[\d\.\,kKmM\s]+")
 m2_rx = re.compile(r"(\d{1,4})\s*(?:m²|m2|m\^2)?", re.IGNORECASE)
+imovel_id_rx = re.compile(r"/imovel/(\d+)", re.IGNORECASE)
 
 def now_utc_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -66,6 +69,7 @@ def parse_money_to_int(value: Optional[Any]) -> Optional[int]:
     s = re.sub(r"[^\d\,\.]", "", s)
     if not s:
         return None
+    # unify
     if "." in s and "," in s and s.rfind(",") > s.rfind("."):
         s = s.replace(".", "").replace(",", ".")
     else:
@@ -121,7 +125,7 @@ def build_page_url(base_url: str, page: int) -> str:
         return base_url + f"?page={page}"
 
 # -------------------------
-# Robust JSON extraction
+# Robust JSON extraction (unchanged)
 # -------------------------
 def try_json_load(s: str):
     s = s.strip()
@@ -249,33 +253,82 @@ def extract_json_from_page(html: str) -> Optional[Dict[str, Any]]:
     return None
 
 # -------------------------
-# Find listing dicts robustly in JSON
+# STRONGER heuristics: identify probable listing dict
 # -------------------------
-def find_listing_objects(obj: Any) -> List[Dict[str, Any]]:
+def is_probable_listing(d: Dict[str, Any], base_url: str = "") -> bool:
     """
-    Busca recursivamente objetos que pareçam representar anúncios.
-    Heurística: dicts que contenham identificadores + informações de preço/address/slug.
+    Regras para aceitar um dict como listing:
+    - precisa conter price-like OR listedPrice OR pricingInfo
+    - e precisa conter id-like key OR slug/url that looks like an individual listing (/imovel/<id>) 
+    - rejeita objects where 'path' or 'slug' looks like category (e.g. '/imovel/apartamento', endswith non-numeric)
     """
+    if not isinstance(d, dict):
+        return False
+    keys_lower = {k.lower() for k in d.keys()}
+    has_price = any(k in keys_lower for k in ("price","valor","listedprice","saleprice","pricinginfo","pricinginfos","priceLabel"))
+    if not has_price:
+        # allow if has area and bedrooms but no price? typically listing has price
+        maybe_area = any(k in keys_lower for k in ("area","usablearea","size"))
+        if not maybe_area:
+            return False
+    # id-like
+    id_keys = [k for k in d.keys() if k.lower() in ("id","listingid","houseid","propertyid","uuid")]
+    if id_keys:
+        return True
+    # check link/slug/path/permalink
+    for possible in ("link","url","slug","path","permalink","relativeUrl"):
+        if possible in d and d[possible]:
+            try:
+                val = str(d[possible])
+            except:
+                continue
+            # direct pattern /imovel/<digits>
+            if imovel_id_rx.search(val):
+                return True
+            # sometimes slug is like 'apartamento-2-quartos-895077000' -> endswith digits
+            m = re.search(r"(\d{5,})$", val)
+            if m:
+                return True
+            # exclude category slugs which are short words like 'apartamento','piscina'
+            # if slug contains '/imovel/' but ends with a word not a number, ignore
+            if "/imovel/" in val.lower():
+                # if contains digits anywhere -> ok
+                if re.search(r"\d{4,}", val):
+                    return True
+                # else likely a category -> reject
+                return False
+    # sometimes nested structure contains 'house' or 'listing' string
+    combined = json.dumps(d).lower()[:1000]
+    if ("house" in combined or "listing" in combined or "property" in combined) and has_price:
+        return True
+    return False
+
+# -------------------------
+# Find listing dicts robustly in JSON (uses is_probable_listing)
+# -------------------------
+def find_listing_objects(obj: Any, base_url: str = "") -> List[Dict[str, Any]]:
     found = []
     if isinstance(obj, dict):
-        lowkeys = {k.lower(): v for k, v in obj.items()}
-        # strong candidates: have id-like and price-like keys
-        if any(k in lowkeys for k in ("id","listingid","houseid","propertyid","uuid")) and \
-           any(k in lowkeys for k in ("price","valor","pricinginfo","pricing","listedprice","saleprice","priceLabel")):
+        # strong candidate
+        if is_probable_listing(obj, base_url):
             found.append(obj)
-        # often listings are in arrays under keys like 'results','listings','searchResults','items'
+        # check lists under likely keys quickly
         for k, v in obj.items():
-            # if value is list of dicts and contains price-like entries, consider it
-            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
-                sample_keys = " ".join(v[0].keys()).lower()
-                if any(kword in sample_keys for kword in ("price","valor","address","slug","id","pricing")):
-                    for item in v:
-                        if isinstance(item, dict):
-                            found.append(item)
-            found += find_listing_objects(v)
+            # if v is a list and likely contains listings, check its items
+            if isinstance(v, list) and v:
+                # quick check of first item keys
+                first = v[0]
+                if isinstance(first, dict):
+                    sample_keys = " ".join(first.keys()).lower()
+                    if any(kword in sample_keys for kword in ("price","listedprice","address","slug","id","pricing","bedroom")):
+                        for it in v:
+                            if isinstance(it, dict) and is_probable_listing(it, base_url):
+                                found.append(it)
+            # recurse
+            found += find_listing_objects(v, base_url)
     elif isinstance(obj, list):
         for item in obj:
-            found += find_listing_objects(item)
+            found += find_listing_objects(item, base_url)
     return found
 
 # -------------------------
@@ -288,15 +341,19 @@ def map_listing_json_to_row(d: Dict[str, Any], base_url: str) -> Dict[str, Any]:
         if candidate in d and d[candidate]:
             link = d[candidate]
             break
-    if not link:
-        # sometimes 'id' needs to be composed
-        if "id" in d and isinstance(d["id"], (str,int)):
-            link = None
-    if link and not str(link).startswith("http"):
+    if link:
         try:
-            link = urljoin(base_url, str(link))
+            link = str(link)
+            if not link.startswith("http"):
+                link = urljoin(base_url, link)
         except:
-            pass
+            link = None
+    # ensure we don't keep category URLs
+    if link and "/imovel/" not in link and not re.search(r"/imovel/\d+", link):
+        # if link ends with common taxonomy words -> drop it
+        if re.search(r"/imovel/(apartamento|casa|kitnet|piscina|lavanderia|academia|playground|sauna|elevador|vagas?)", link, re.I):
+            link = None
+
     # address
     address = None; rua=None; bairro=None; cidade=None
     if "address" in d and d.get("address"):
@@ -314,6 +371,7 @@ def map_listing_json_to_row(d: Dict[str, Any], base_url: str) -> Dict[str, Any]:
                 rua = parts[0]; bairro = parts[1]
             else:
                 rua = addr_text
+
     # price
     valor = None
     for k in ("price","valor","listedPrice","salePrice","displayPrice","priceLabel"):
@@ -329,7 +387,7 @@ def map_listing_json_to_row(d: Dict[str, Any], base_url: str) -> Dict[str, Any]:
             iptu = d[k]; break
     # area
     m2 = None
-    for k in ("area","usableArea","size","area_m2"):
+    for k in ("area","usableArea","size","area_m2","usable_area"):
         if k in d and d[k]:
             m2 = d[k]; break
     # quartos suites vagas
@@ -351,6 +409,7 @@ def map_listing_json_to_row(d: Dict[str, Any], base_url: str) -> Dict[str, Any]:
                 ano = int(d[k]); break
             except:
                 pass
+
     return {
         "Endereço": address or None,
         "Rua": rua,
@@ -373,7 +432,7 @@ def map_listing_json_to_row(d: Dict[str, Any], base_url: str) -> Dict[str, Any]:
     }
 
 # -------------------------
-# HTML fallback parser
+# HTML fallback parser (unchanged)
 # -------------------------
 def parse_cards_with_bs(html: str, base_url: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "lxml")
@@ -447,7 +506,7 @@ def parse_cards_with_bs(html: str, base_url: str) -> List[Dict[str, Any]]:
     return cards
 
 # -------------------------
-# Detailed listing-page parser
+# Detailed listing-page parser (unchanged logic)
 # -------------------------
 def parse_listing_page(url: str) -> Dict[str, Any]:
     headers = {"User-Agent": "Mozilla/5.0 (compatible; QuintoAndarDetailScraper/1.0)", "Accept-Language": "pt-BR,pt;q=0.9"}
@@ -460,10 +519,9 @@ def parse_listing_page(url: str) -> Dict[str, Any]:
     html = resp.text
     js = extract_json_from_page(html)
     if js:
-        candidates = find_listing_objects(js)
+        candidates = find_listing_objects(js, base_url=resp.url)
         best = None
         for c in candidates:
-            # choose candidate that has link or pricing
             if any(k in c for k in ("link","slug","url")) or any(k in c for k in ("price","listedPrice","pricingInfo","pricingInfos")):
                 best = c
                 break
@@ -474,7 +532,6 @@ def parse_listing_page(url: str) -> Dict[str, Any]:
             return mapped
     # fallback HTML scraping for details:
     soup = BeautifulSoup(html, "lxml")
-    full_text = soup.get_text(" ", strip=True)
     cond = None
     m = re.search(r"Condom[ií]nio[:\s]*R?\$?[\s\d\.\,kKmM]+", html, re.I)
     if m:
@@ -540,7 +597,7 @@ def parse_listing_page(url: str) -> Dict[str, Any]:
     }
 
 # -------------------------
-# Parse search page
+# Parse search page (uses improved find_listing_objects)
 # -------------------------
 def parse_search_page(url: str) -> List[Dict[str, Any]]:
     headers = {"User-Agent": "Mozilla/5.0 (compatible; QuintoAndarScraper/1.0)", "Accept-Language": "pt-BR,pt;q=0.9"}
@@ -551,23 +608,34 @@ def parse_search_page(url: str) -> List[Dict[str, Any]]:
     json_obj = extract_json_from_page(html)
     rows = []
     base_url = resp.url
-    # If JSON found, show keys sample for diagnostics
+    # diagnostics counters
+    found_candidates = 0
+    accepted = 0
+    rejected = 0
     if json_obj:
+        # sample keys for diagnostics
         try:
             top_keys = list(json_obj.keys())[:20] if isinstance(json_obj, dict) else None
             st.session_state.json_keys_sample = {"top_keys": top_keys}
         except Exception:
             st.session_state.json_keys_sample = None
-    if json_obj:
-        listing_dicts = find_listing_objects(json_obj)
-        if listing_dicts:
-            for d in listing_dicts:
-                row = map_listing_json_to_row(d, base_url)
-                if row.get("Link") or row.get("Valor") or row.get("M2"):
-                    rows.append(row)
-            if rows:
-                return rows
-        # deeper search inside lists/dicts
+
+        listing_dicts = find_listing_objects(json_obj, base_url=base_url)
+        found_candidates = len(listing_dicts)
+        for d in listing_dicts:
+            row = map_listing_json_to_row(d, base_url)
+            # apply final plausibility filter: link must be imovel or Valor/M2 present
+            if row.get("Link") and imovel_id_rx.search(str(row.get("Link"))):
+                rows.append(row); accepted += 1
+            elif row.get("Valor") or row.get("M2"):
+                rows.append(row); accepted += 1
+            else:
+                rejected += 1
+        # deeper lists fallback (rare)
+        if rows:
+            st.session_state.diagnostic_counts = {"candidates": found_candidates, "accepted": accepted, "rejected": rejected}
+            return rows
+        # traverse for lists deeper
         def traverse_for_lists(o):
             found = []
             if isinstance(o, dict):
@@ -584,15 +652,19 @@ def parse_search_page(url: str) -> List[Dict[str, Any]]:
         for lst in lists:
             for it in lst:
                 if isinstance(it, dict):
-                    candidates = find_listing_objects(it)
-                    if candidates:
-                        for d in candidates:
-                            row = map_listing_json_to_row(d, base_url)
-                            if row.get("Link") or row.get("Valor"):
-                                rows.append(row)
+                    candidates = find_listing_objects(it, base_url=base_url)
+                    for d in candidates:
+                        row = map_listing_json_to_row(d, base_url)
+                        if row.get("Link") and imovel_id_rx.search(str(row.get("Link"))):
+                            rows.append(row); accepted += 1
+                        elif row.get("Valor") or row.get("M2"):
+                            rows.append(row); accepted += 1
+                        else:
+                            rejected += 1
+        st.session_state.diagnostic_counts = {"candidates": found_candidates, "accepted": accepted, "rejected": rejected}
         if rows:
             return rows
-    # fallback to HTML parsing
+    # fallback: parse cards with bs
     cards = parse_cards_with_bs(html, base_url)
     return cards
 
@@ -607,14 +679,20 @@ def parse_multiple_pages(base_url: str, pages: int) -> pd.DataFrame:
         try:
             items = parse_search_page(page_url)
             for it in items:
-                if not it.get("Valor") and not it.get("M2") and not it.get("Link"):
+                # filter again: keep only rows that look like listings
+                if it.get("Link") and imovel_id_rx.search(str(it.get("Link"))):
+                    all_rows.append(it)
+                elif it.get("Valor") or it.get("M2"):
+                    all_rows.append(it)
+                else:
+                    # skip likely category / taxo links
                     continue
-                all_rows.append(it)
         except Exception as e:
             logger.exception("Error parsing page %s", page_url)
         time.sleep(float(st.session_state.settings.get("per_request_delay_sec", 0.6)))
     if not all_rows:
         return pd.DataFrame()
+    # dedupe by Link or Endereço+Valor
     seen = set()
     clean = []
     for r in all_rows:
@@ -643,6 +721,9 @@ def enrich_with_listing_pages(df: pd.DataFrame, max_to_open: int = 5) -> pd.Data
     for link in links:
         if opened >= max_to_open:
             break
+        # prefer only real listing links
+        if not imovel_id_rx.search(str(link)):
+            continue
         try:
             detail = parse_listing_page(link)
             if not detail:
@@ -668,8 +749,8 @@ def enrich_with_listing_pages(df: pd.DataFrame, max_to_open: int = 5) -> pd.Data
 # -------------------------
 # UI
 # -------------------------
-st.title("🏘️ QuintoAndar — Extrator otimizado → Excel")
-st.markdown("Cole a URL da página de busca do QuintoAndar (ex.: bairros). O scraper usa o JSON embutido quando possível e pode abrir até 5 anúncios individuais para enriquecer dados.")
+st.title("🏘️ QuintoAndar — Extrator filtrado → Excel")
+st.markdown("Cole a URL da página de busca do QuintoAndar (ex.: Bela Vista). O scraper agora filtra fortemente objetos não-listing (categorias/amenities) e prioriza anúncios reais. Ative 'Abrir anúncios individuais' para enriquecer (teste 5).")
 
 col1, col2 = st.columns([4, 1])
 with col1:
@@ -697,7 +778,7 @@ except Exception:
 if run_btn and url_input:
     st.session_state.scrape_url = url_input
     pages = int(st.session_state.settings.get("max_pages", 5))
-    st.info(f"Iniciando extração de até {pages} páginas (JSON-first).")
+    st.info(f"Iniciando extração de até {pages} páginas (JSON-first, filtro estrito).")
     try:
         df = parse_multiple_pages(url_input, pages)
         if df.empty:
@@ -736,7 +817,7 @@ if st.session_state.get("scrape_df") is not None:
     df_preview = st.session_state.scrape_df.copy()
     st.markdown("Prévia dos resultados:")
     st.dataframe(df_preview.head(200))
-    fname = f"quintoandar_listings_{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
+    fname = f"quintoandar_listings_filtered_{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
     st.download_button("Baixar Excel (listings)", data=df_to_excel_bytes(df_preview), file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
     st.info("Sem DataFrame disponível. Execute uma extração.")
@@ -748,6 +829,7 @@ with st.expander("Diagnóstico / Amostras (útil para ajustes)"):
     st.json(st.session_state.get("last_raw_sample", {}))
     st.write("JSON keys sample (raiz):")
     st.json(st.session_state.get("json_keys_sample", {}))
-    st.caption("Se quiser, cole aqui o 'probe' e as primeiras chaves exibidas que eu ajusto mapeamentos exatos.")
+    st.write("Diagnostic counts (candidates / accepted / rejected):")
+    st.json(st.session_state.get("diagnostic_counts", {}))
 
-st.caption("Notas: O scraper prioriza o JSON embutido (__NEXT_DATA__). Valores monetários e áreas são normalizados; campos ausentes ficam como None. O modo 'Abrir anúncios individuais' enriquece dados pegando campos que só aparecem na página do anúncio.")
+st.caption("Notas: agora o scraper filtra fortemente objetos não-listing (categorias/amenities). Se ainda aparecerem links incorretos, cole aqui o conteúdo de 'Diagnostic counts' e 5 exemplos de 'Link' do Excel (posso ajustar a regex de detecção /imovel/).")

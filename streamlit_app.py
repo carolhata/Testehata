@@ -33,15 +33,25 @@ class AppSettings(BaseModel):
     def clamp_max(cls, v):
         return min(v, 1000)
 
+# Ensure settings exist in session_state and are valid
 if "settings" not in st.session_state:
-    st.session_state.settings = AppSettings().dict()
+    st.session_state["settings"] = AppSettings().dict()
+else:
+    # validate/repair if needed
+    try:
+        _ = AppSettings(**st.session_state.get("settings", {}))
+    except Exception:
+        st.session_state["settings"] = AppSettings().dict()
+
+# Helper to get a setting with fallback
+def get_setting(name: str, fallback: Any):
+    return st.session_state.get("settings", {}).get(name, fallback)
 
 HEADERS_BASE = {
     "User-Agent": "Mozilla/5.0 (compatible; StreamlitScraper/1.0)",
     "Accept": "application/json, text/plain, */*",
     "Content-Type": "application/json",
-    # Zap expects this header in many calls (observed): 
-    # X-Application-Name: zap-web-desktop
+    # Zap usually expects this header:
     "X-Application-Name": "zap-web-desktop",
     "Referer": "https://www.zapimoveis.com.br/"
 }
@@ -66,7 +76,6 @@ def safe_get(url: str, timeout: int = 20, extra_headers: Optional[dict] = None) 
         headers = HEADERS_BASE.copy()
         if extra_headers:
             headers.update(extra_headers)
-        # for GET, remove Content-Type
         headers.pop("Content-Type", None)
         resp = requests.get(url, headers=headers, timeout=timeout)
         resp.raise_for_status()
@@ -76,61 +85,42 @@ def safe_get(url: str, timeout: int = 20, extra_headers: Optional[dict] = None) 
         return None
 
 def build_payload_for_zap(city: Optional[str], neighborhood: Optional[str], area_min: Optional[int], area_max: Optional[int], page: int = 1, size: int = 50) -> dict:
-    """
-    Build a filter payload for Zap glue API.
-    This payload is heuristic-based (observed patterns). It aims to request apartments for sale.
-    """
     payload = {
         "business": ["SALE"],
         "category": ["APARTMENT"],
-        "page": page - 1,  # some endpoints use 0-index pages
-        "size": size,
+        "page": max(0, page - 1),
+        "size": max(1, size),
         "filters": []
     }
-
-    # city / neighborhood mapping via address filters if provided
     if city:
-        payload.setdefault("filters", []).append({
-            "name": "addressCity",
-            "value": [city]
-        })
+        payload["filters"].append({"name": "addressCity", "value": [city]})
     if neighborhood:
-        payload.setdefault("filters", []).append({
-            "name": "addressNeighborhood",
-            "value": [neighborhood]
-        })
-    # area range
+        payload["filters"].append({"name": "addressNeighborhood", "value": [neighborhood]})
     if area_min or area_max:
-        # Zap sometimes expects range filters with names like 'usableArea'
-        range_filter = {"name": "usableArea", "range": {}}
+        rf = {"name": "usableArea", "range": {}}
         if area_min:
-            range_filter["range"]["min"] = int(area_min)
+            rf["range"]["min"] = int(area_min)
         if area_max:
-            range_filter["range"]["max"] = int(area_max)
-        payload.setdefault("filters", []).append(range_filter)
-
+            rf["range"]["max"] = int(area_max)
+        payload["filters"].append(rf)
     return payload
 
 def extract_listing_from_zap_item(item: Dict[str,Any]) -> Dict[str,Any]:
-    """
-    Defensive mapping of API item to the requested schema fields.
-    """
     out = {"Endereço": None, "Valor": None, "Condominio": None, "IPTU": None,
            "M2": None, "Quartos": None, "Suites": None, "Vagas": None, "Link": None}
+    if not isinstance(item, dict):
+        return out
 
     def g(*keys):
         for k in keys:
-            if isinstance(item, dict) and k in item and item[k] is not None:
+            if k in item and item[k] is not None:
                 return item[k]
         return None
 
-    # common fields
-    # Link/url
     link = g("absoluteUrl", "url", "link", "listingUrl")
     if link:
         out["Link"] = link if link.startswith("http") else ("https://www.zapimoveis.com.br" + link)
 
-    # Price - various shapes
     price_obj = g("price", "businessPrice", "priceSpecification", "pricing", "value")
     if isinstance(price_obj, dict):
         p = price_obj.get("value") or price_obj.get("amount") or price_obj.get("price")
@@ -139,7 +129,6 @@ def extract_listing_from_zap_item(item: Dict[str,Any]) -> Dict[str,Any]:
     elif price_obj is not None:
         out["Valor"] = str(price_obj)
 
-    # condo / iptu
     condo = g("condominiumFee", "condominium", "condominiumFeeFormatted")
     if condo:
         out["Condominio"] = str(condo)
@@ -147,7 +136,6 @@ def extract_listing_from_zap_item(item: Dict[str,Any]) -> Dict[str,Any]:
     if iptu:
         out["IPTU"] = str(iptu)
 
-    # area
     area = g("usableArea", "floorArea", "area", "size")
     if isinstance(area, dict):
         av = area.get("value") or area.get("amount") or area.get("size")
@@ -156,7 +144,6 @@ def extract_listing_from_zap_item(item: Dict[str,Any]) -> Dict[str,Any]:
     elif area is not None:
         out["M2"] = str(area)
 
-    # bedrooms, suites, parking
     beds = g("bedrooms", "bedroom", "numberBedrooms")
     if beds is not None:
         out["Quartos"] = str(beds)
@@ -167,7 +154,6 @@ def extract_listing_from_zap_item(item: Dict[str,Any]) -> Dict[str,Any]:
     if parking is not None:
         out["Vagas"] = str(parking)
 
-    # address: item may include structured address
     addr = g("address", "location", "addressLocation", "place")
     if isinstance(addr, dict):
         parts = []
@@ -184,17 +170,14 @@ def extract_listing_from_zap_item(item: Dict[str,Any]) -> Dict[str,Any]:
     elif isinstance(addr, str):
         out["Endereço"] = addr
 
-    # fallback: try 'title' or 'headline'
     if not out["Endereço"]:
         title = g("title", "headline", "name")
         if title:
             out["Endereço"] = str(title)
 
-    # normalize whitespace
     for k,v in out.items():
         if isinstance(v, str):
             out[k] = re.sub(r"\s+", " ", v).strip()
-
     return out
 
 # Fallback HTML heuristics (lightweight)
@@ -278,6 +261,11 @@ st.markdown(
     "O app fará uma chamada POST para a API do Zap com filtros (cidade/bairro/área) e tentará retornar os anúncios."
 )
 
+# Read safe defaults from session settings
+default_max_results = int(get_setting("max_results", 100))
+default_page_size = int(get_setting("page_size", 50))
+default_timeout = int(get_setting("timeout_sec", 20))
+
 col_main, col_side = st.columns([3,1])
 with col_main:
     listings_url = st.text_input("URL da página de listagens (Zap Imóveis)", value=st.session_state.get("last_listings_url",""))
@@ -285,8 +273,8 @@ with col_main:
     neighborhood = st.text_input("Bairro (opcional) — ex: Pinheiros", value="")
     area_min = st.number_input("Área mínima (m², opcional)", min_value=0, value=0, step=1)
     area_max = st.number_input("Área máxima (m², opcional)", min_value=0, value=0, step=1)
-    max_results = st.number_input("Máx resultados (total)", min_value=10, max_value=1000, value=int(st.session_state.settings["max_results"]))
-    page_size = st.number_input("Tamanho da página (page size)", min_value=10, max_value=200, value=int(st.session_state.settings["page_size"]))
+    max_results = st.number_input("Máx resultados (total)", min_value=10, max_value=1000, value=default_max_results)
+    page_size = st.number_input("Tamanho da página (page size)", min_value=10, max_value=200, value=default_page_size)
 with col_side:
     run_btn = st.button("Extrair via API POST")
     fallback_btn = st.button("Forçar heurística HTML")
@@ -301,7 +289,6 @@ if run_btn:
         st.error("Cole a URL da página de listagens antes de rodar.")
     else:
         st.session_state["last_listings_url"] = listings_url
-        # Build payload
         payload = build_payload_for_zap(city=city or None,
                                         neighborhood=neighborhood or None,
                                         area_min=(area_min if area_min>0 else None),
@@ -311,21 +298,18 @@ if run_btn:
         st.info("Enviando requisição POST para glue-api.zapimoveis.com.br ...")
         with st.spinner("Chamando API do Zap (POST)..."):
             api_url = "https://glue-api.zapimoveis.com.br/v3/listings"
-            resp = safe_post(api_url, json_payload=payload, timeout=int(st.session_state.settings["timeout_sec"]))
+            resp = safe_post(api_url, json_payload=payload, timeout=default_timeout)
         results: List[Dict[str,Any]] = []
         if resp:
             try:
                 j = resp.json()
-                # normalize possible containers
                 items = j.get("content") or j.get("listings") or j.get("data") or j.get("results") or j.get("hits") or j
-                # If paginated wrapper
                 if isinstance(items, dict) and "content" in items:
                     items = items["content"]
                 if isinstance(items, dict) and "listings" in items:
                     items = items["listings"]
                 if isinstance(items, dict) and "data" in items and isinstance(items["data"], list):
                     items = items["data"]
-                # items should be list-like
                 if isinstance(items, list) and items:
                     st.success(f"API retornou {len(items)} itens. Extraindo campos...")
                     max_take = min(int(max_results), len(items))
@@ -342,7 +326,6 @@ if run_btn:
                     progress.empty()
                 else:
                     st.warning("A API respondeu, mas não retornou uma lista de anúncios no payload padrão.")
-                    # put full JSON in diagnostics
                     st.code(json.dumps(j, indent=2, ensure_ascii=False)[:5000])
             except Exception as e:
                 logger.exception("Erro lendo JSON retornado pela API")
@@ -353,14 +336,14 @@ if run_btn:
         # fallback to heuristics if no results
         if not results:
             st.info("Tentando heurística genérica de links (HTML scraping)...")
-            links = gather_listing_links_generic(listings_url, max_links=int(max_results), timeout=int(st.session_state.settings["timeout_sec"]))
+            links = gather_listing_links_generic(listings_url, max_links=int(max_results), timeout=default_timeout)
             if not links:
                 st.error("Nenhum link de anúncio encontrado com heurística — o site provavelmente carrega via JS. Podemos usar Playwright (renderização) se quiser.")
             else:
                 st.info(f"{len(links)} links encontrados — extraindo páginas individuais.")
                 progress = st.progress(0)
                 for i, link in enumerate(links[:int(max_results)], start=1):
-                    parsed = parse_listing_page_basic(link, timeout=int(st.session_state.settings["timeout_sec"]))
+                    parsed = parse_listing_page_basic(link, timeout=default_timeout)
                     results.append(parsed)
                     progress.progress(int(i/len(links)*100))
                 progress.empty()
@@ -368,7 +351,6 @@ if run_btn:
         # Finalize DataFrame
         if results:
             df = pd.DataFrame(results)
-            # ensure columns exist & order
             cols = ["Endereço","Valor","Condominio","IPTU","M2","Quartos","Suites","Vagas","Link"]
             for c in cols:
                 if c not in df.columns:
@@ -380,20 +362,19 @@ if run_btn:
             st.warning("Nenhum anúncio extraído.")
 
 if fallback_btn:
-    # Force heuristic without attempting API
     st.session_state["last_listings_url"] = st.session_state.get("last_listings_url","")
     url = st.session_state.get("last_listings_url","")
     if not url:
         st.error("Defina a URL antes de forçar heurística.")
     else:
-        links = gather_listing_links_generic(url, max_links=int(st.session_state.settings["max_results"]), timeout=int(st.session_state.settings["timeout_sec"]))
+        links = gather_listing_links_generic(url, max_links=int(get_setting("max_results", 100)), timeout=int(get_setting("timeout_sec", 20)))
         results = []
         if not links:
             st.error("Nenhum link encontrado com heurística.")
         else:
             progress = st.progress(0)
             for i, link in enumerate(links, start=1):
-                parsed = parse_listing_page_basic(link, timeout=int(st.session_state.settings["timeout_sec"]))
+                parsed = parse_listing_page_basic(link, timeout=int(get_setting("timeout_sec", 20)))
                 results.append(parsed)
                 progress.progress(int(i/len(links)*100))
             progress.empty()
@@ -427,14 +408,15 @@ with st.expander("Diagnóstico e dicas"):
     st.write("")
     st.json({
         "last_listings_url": st.session_state.get("last_listings_url",""),
-        "city": city,
-        "neighborhood": neighborhood,
-        "area_min": int(area_min) if area_min else None,
-        "area_max": int(area_max) if area_max else None,
-        "max_results": int(max_results),
-        "page_size": int(page_size),
-        "timeout_sec": int(st.session_state.settings["timeout_sec"])
+        "city": locals().get("city", ""),
+        "neighborhood": locals().get("neighborhood", ""),
+        "area_min": int(locals().get("area_min", 0)) if locals().get("area_min", 0) else None,
+        "area_max": int(locals().get("area_max", 0)) if locals().get("area_max", 0) else None,
+        "max_results": int(max_results) if "max_results" in locals() else get_setting("max_results", 100),
+        "page_size": int(page_size) if "page_size" in locals() else get_setting("page_size", 50),
+        "timeout_sec": int(get_setting("timeout_sec", 20))
     })
 
 st.caption("Este app tenta uso API-first (POST) ao Glue API do Zap; caso não responda, usa heurística HTML como fallback. Se quiser que eu ajuste filtros ou headers, cole um exemplo de URL e eu adapto.")
+
 

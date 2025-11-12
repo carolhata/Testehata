@@ -747,6 +747,79 @@ def enrich_with_listing_pages(df: pd.DataFrame, max_to_open: int = 5) -> pd.Data
     return df
 
 # -------------------------
+# Helpers: sanitize DataFrame for display / download
+# -------------------------
+import math
+import json
+
+def _to_json_str_safe(x):
+    try:
+        return json.dumps(x, ensure_ascii=False)
+    except Exception:
+        try:
+            return str(x)
+        except Exception:
+            return ""
+
+def sanitize_df_for_display(df: pd.DataFrame, max_cell_len: int = 2000) -> pd.DataFrame:
+    """
+    Converte colunas que contenham dict/list/objects em strings seguras para PyArrow,
+    trunca strings muito longas e garante tipos em colunas numéricas esperadas.
+    """
+    if df is None or df.empty:
+        return df
+    df2 = df.copy()
+
+    # Normalize expected numeric columns
+    numeric_cols = ["Valor", "Condominio", "IPTU", "M2", "Quartos", "Suites", "Vaga"]
+    for c in numeric_cols:
+        if c in df2.columns:
+            # coerce to numeric, preserve NaN if not convertible
+            try:
+                df2[c] = pd.to_numeric(df2[c], errors="coerce").astype("Int64")
+            except Exception:
+                # fallback: attempt to parse strings with parse_money_to_int if available
+                try:
+                    df2[c] = df2[c].apply(lambda v: parse_money_to_int(v) if not pd.isna(v) else None).astype("Int64")
+                except Exception:
+                    pass
+
+    # Convert complex types to strings and truncate long strings
+    for col in df2.columns:
+        # skip already-safe numeric / datetime types
+        try:
+            if pd.api.types.is_numeric_dtype(df2[col]) or pd.api.types.is_datetime64_any_dtype(df2[col]):
+                continue
+        except Exception:
+            # if dtype inspect fails, continue to cleaning logic
+            pass
+
+        # map lists/dicts to json strings and truncate
+        def _cell_clean(v):
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                return None
+            # dict/list/tuple -> json string
+            if isinstance(v, (dict, list, tuple)):
+                s = _to_json_str_safe(v)
+            else:
+                s = str(v)
+            # truncate
+            if len(s) > max_cell_len:
+                return s[:max_cell_len] + " ...[truncated]"
+            return s
+        try:
+            df2[col] = df2[col].apply(_cell_clean)
+        except Exception:
+            # last resort: convert whole column to string safely
+            try:
+                df2[col] = df2[col].astype(str).apply(lambda s: s if len(s) <= max_cell_len else s[:max_cell_len] + " ...[truncated]")
+            except Exception:
+                # if even that fails, set as empty strings to avoid pyarrow crash
+                df2[col] = df2[col].apply(lambda _: None)
+    return df2
+
+
+# -------------------------
 # UI
 # -------------------------
 st.title("🏘️ QuintoAndar — Extrator filtrado → Excel")
@@ -820,18 +893,39 @@ if st.session_state.get("scrape_df") is not None:
     df_preview_display = sanitize_df_for_display(df_preview, max_cell_len=2000)
 
     st.markdown("Prévia dos resultados (limpa para exibição):")
-    st.dataframe(df_preview_display.head(100))  # pode aumentar para 200 se quiser
+    st.dataframe(df_preview_display.head(100))  # mostra até 100 linhas sanitizadas
 
-    # ✅ Gera arquivo Excel seguro para download (mantém estrutura original)
+    # ✅ Gera arquivo Excel seguro para download (serializa dicts/lists em strings)
     fname = f"quintoandar_listings_filtered_{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
+
+    # Use uma função de export segura (converte dict/list em JSON strings antes de salvar)
+    def df_to_excel_bytes_safe(df: pd.DataFrame, sheet_name: str = "listings"):
+        df_export = df.copy()
+        for col in df_export.columns:
+            try:
+                if df_export[col].apply(lambda x: isinstance(x, (dict, list, tuple))).any():
+                    df_export[col] = df_export[col].apply(lambda v: _to_json_str_safe(v) if v is not None else "")
+            except Exception:
+                # se falhar ao checar, converte col inteira para string
+                try:
+                    df_export[col] = df_export[col].astype(str)
+                except Exception:
+                    df_export[col] = df_export[col].apply(lambda v: str(v) if v is not None else "")
+        bio = BytesIO()
+        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+            df_export.to_excel(writer, index=False, sheet_name=sheet_name)
+        bio.seek(0)
+        return bio.read()
+
     st.download_button(
         "Baixar Excel (listings)",
-        data=df_to_excel_bytes(df_preview),
+        data=df_to_excel_bytes_safe(df_preview),
         file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 else:
     st.info("Sem DataFrame disponível. Execute uma extração.")
+
 
 
 with st.expander("Diagnóstico / Amostras (útil para ajustes)"):

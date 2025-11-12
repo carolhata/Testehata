@@ -127,45 +127,142 @@ def build_page_url(base_url: str, page: int) -> str:
 # -------------------------
 # JSON extraction from scripts (__NEXT_DATA__ or window.__NEXT_DATA__)
 # -------------------------
-def extract_json_from_page(html: str) -> Optional[Dict[str, Any]]:
-    soup = BeautifulSoup(html, "lxml")
-    # try script with id __NEXT_DATA__
-    script = soup.find("script", id="__NEXT_DATA__")
-    if script and script.string:
-        try:
-            return json.loads(script.string)
-        except Exception:
-            pass
-    # fallback: search any <script> containing 'window.__NEXT_DATA__' or 'window.__INITIAL_STATE__'
-    for s in soup.find_all("script"):
-        text = s.string or s.get_text(" ", strip=True) or ""
-        if "window.__NEXT_DATA__" in text or "window.__INITIAL_STATE__" in text or "searchResults" in text:
-            # try find JSON substring
+# Substitua a função extract_json_from_page e find_listing_objects por esta versão mais robusta.
+
+import json
+import re
+from bs4 import BeautifulSoup
+from typing import Any, Dict, List
+
+def contains_listing_like(obj: Any) -> bool:
+    """Heurística: procura chaves/valores que sugerem um objeto de listing."""
+    if isinstance(obj, dict):
+        keys = " ".join(k.lower() for k in obj.keys())
+        if any(k in keys for k in ["price", "valor", "listing", "property", "id", "slug", "address", "bedrooms"]):
+            return True
+        for v in obj.values():
+            if contains_listing_like(v):
+                return True
+    elif isinstance(obj, list):
+        for it in obj:
+            if contains_listing_like(it):
+                return True
+    return False
+
+def try_json_load(s: str):
+    """Tenta json.loads com limpeza incremental — retorna objeto ou None."""
+    s = s.strip()
+    # quick reject
+    if not s or (not (s.startswith("{") or s.startswith("["))):
+        return None
+    # tentativa direta
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # tentativa progressiva: expandindo até achar JSON válido (mais lenta mas robusta)
+    # encontre primeiro '{' e tente cortar até diferentes finais válidos
+    start = None
+    for i, ch in enumerate(s):
+        if ch in "{[":
+            start = i
+            break
+    if start is None:
+        return None
+    # tente encontrar matching brace por heurística (procura último '}' ou ']' e tenta parse)
+    for end in range(len(s)-1, start, -1):
+        if s[end] in "}]":
+            snippet = s[start:end+1]
             try:
-                # find first { and last } and parse
-                first = text.find("{")
-                last = text.rfind("}")
-                if first != -1 and last != -1 and last > first:
-                    snippet = text[first:last+1]
-                    return json.loads(snippet)
+                return json.loads(snippet)
             except Exception:
                 continue
     return None
 
+def extract_json_from_page(html: str) -> Optional[Dict[str, Any]]:
+    """
+    Versão robusta para encontrar JSON embutido no HTML:
+    - tenta <script id="__NEXT_DATA__"> (Next.js)
+    - busca por window.__NEXT_DATA__ = {...}
+    - busca por window.__INITIAL_STATE__ = {...}
+    - varre scripts buscando o maior JSON válido que contenha dados de listing
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # 1) script id __NEXT_DATA__
+    script = soup.find("script", id="__NEXT_DATA__")
+    if script and (script.string or script.get_text()):
+        s = script.string if script.string else script.get_text()
+        parsed = try_json_load(s)
+        if parsed:
+            return parsed
+
+    # 2) window.__NEXT_DATA__ assignment in any script
+    for s in soup.find_all("script"):
+        text = s.string or s.get_text(" ", strip=True) or ""
+        if "window.__NEXT_DATA__" in text or "window.__INITIAL_STATE__" in text or "window.__PRELOADED_STATE__" in text:
+            # try to extract the first JSON-looking substring after '='
+            m = re.search(r"(window\.__NEXT_DATA__\s*=\s*|window\.__INITIAL_STATE__\s*=\s*|window\.__PRELOADED_STATE__\s*=\s*)(?P<json>[\s\S]+)", text)
+            if m:
+                right = m.group("json").strip()
+                # strip trailing semicolon if exists
+                right = re.sub(r";\s*$", "", right)
+                parsed = try_json_load(right)
+                if parsed:
+                    return parsed
+                # if not, attempt to find the first opening brace and progressive parse
+                parsed = try_json_load(right)
+                if parsed:
+                    return parsed
+
+    # 3) scan all scripts and try to find a JSON substring that looks like listings
+    candidate_scripts = []
+    for s in soup.find_all("script"):
+        txt = s.string or s.get_text(" ", strip=True) or ""
+        # quick filter: script must contain a brace and at least one keyword
+        if ("{" in txt or "[" in txt) and any(k in txt.lower() for k in ("list", "listing", "property", "search", "results", "props")):
+            candidate_scripts.append(txt)
+
+    # sort by length descending (prefer big embedded JSON blobs)
+    candidate_scripts = sorted(set(candidate_scripts), key=lambda x: len(x), reverse=True)
+
+    for txt in candidate_scripts:
+        parsed = try_json_load(txt)
+        if parsed and contains_listing_like(parsed):
+            return parsed
+        # if direct parse failed, attempt progressive extraction of JSON-like substrings within txt
+        # look for all occurrences of '{' and try to parse from there progressively
+        for m in re.finditer(r"[\{\[]", txt):
+            sub = txt[m.start():m.start()+500000]  # window
+            parsed = try_json_load(sub)
+            if parsed and contains_listing_like(parsed):
+                return parsed
+
+    # nothing found
+    return None
+
 def find_listing_objects(obj: Any) -> List[Dict[str, Any]]:
+    """
+    Heurística recursiva para extrair estruturas de listing a partir do objeto JSON.
+    Retorna lista de dicionários candidatos (potenciais listings).
+    """
     found = []
     if isinstance(obj, dict):
-        keys = {k.lower(): v for k, v in obj.items()}
-        # heuristic: object representing listing likely has 'id' or 'houseId' and some price/value fields
-        if any(k in keys for k in ("id", "listingid", "houseid", "propertyid")) and any(k in keys for k in ("price", "valor", "priceinfo", "pricing")):
+        low = {k.lower(): v for k, v in obj.items()}
+        # se o dict tem identificador e preço/valor, é forte candidato
+        if any(k in low for k in ("id", "listingid", "houseid", "propertyid", "uuid")) and \
+           any(k in low for k in ("price", "valor", "priceinfo", "pricing", "listedprice")):
             found.append(obj)
-        # search nested
+        # explorar chaves que sejam listas/objetos
         for v in obj.values():
             found += find_listing_objects(v)
     elif isinstance(obj, list):
         for item in obj:
             found += find_listing_objects(item)
     return found
+
+
+
 
 # -------------------------
 # Map JSON listing -> normalized row

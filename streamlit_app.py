@@ -4,7 +4,7 @@ import re
 import json
 import logging
 from io import BytesIO
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 
@@ -17,216 +17,187 @@ from pydantic import BaseModel, Field, PositiveInt, validator
 # -------------------------
 # Config
 # -------------------------
-st.set_page_config(page_title="Raspador Zap Imóveis — API-first", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="Zap Imóveis — API POST Extractor", page_icon="🏠", layout="wide")
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("zap-api-scraper")
+logger = logging.getLogger("zap-post-scraper")
 
 # -------------------------
-# Secrets (OpenAI/Tavily optional)
-# -------------------------
-def get_secret(name: str) -> Optional[str]:
-    try:
-        return st.secrets.get(name, None)
-    except Exception:
-        return None
-
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
-TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
-
-# -------------------------
-# Settings model
+# Settings / Defaults
 # -------------------------
 class AppSettings(BaseModel):
-    max_listing_links: PositiveInt = Field(default=50)
+    max_results: PositiveInt = Field(default=100)
+    page_size: PositiveInt = Field(default=50)
     timeout_sec: PositiveInt = Field(default=20)
 
-    @validator("max_listing_links")
-    def clamp_max_links(cls, v):
-        return min(v, 500)
+    @validator("max_results")
+    def clamp_max(cls, v):
+        return min(v, 1000)
 
 if "settings" not in st.session_state:
     st.session_state.settings = AppSettings().dict()
 
-HEADERS = {
+HEADERS_BASE = {
     "User-Agent": "Mozilla/5.0 (compatible; StreamlitScraper/1.0)",
-    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    # Zap's glue API may accept requests without special headers, but we'll include a referer when possible.
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    # Zap expects this header in many calls (observed): 
+    # X-Application-Name: zap-web-desktop
+    "X-Application-Name": "zap-web-desktop",
+    "Referer": "https://www.zapimoveis.com.br/"
 }
 
 # -------------------------
 # Helpers
 # -------------------------
-def safe_get(url: str, timeout: int = 15, extra_headers: Optional[Dict[str,str]] = None) -> Optional[requests.Response]:
+def safe_post(url: str, json_payload: dict, timeout: int = 20, extra_headers: Optional[dict] = None) -> Optional[requests.Response]:
     try:
-        headers = HEADERS.copy()
+        headers = HEADERS_BASE.copy()
         if extra_headers:
             headers.update(extra_headers)
+        resp = requests.post(url, json=json_payload, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        return resp
+    except Exception as e:
+        logger.debug(f"safe_post failed {url}: {e}", exc_info=True)
+        return None
+
+def safe_get(url: str, timeout: int = 20, extra_headers: Optional[dict] = None) -> Optional[requests.Response]:
+    try:
+        headers = HEADERS_BASE.copy()
+        if extra_headers:
+            headers.update(extra_headers)
+        # for GET, remove Content-Type
+        headers.pop("Content-Type", None)
         resp = requests.get(url, headers=headers, timeout=timeout)
         resp.raise_for_status()
         return resp
     except Exception as e:
-        logger.debug(f"safe_get failed {url}: {e}")
+        logger.debug(f"safe_get failed {url}: {e}", exc_info=True)
         return None
 
-def try_zap_glue_api(listings_page: str, max_items: int = 50, timeout: int = 20) -> List[Dict[str, Any]]:
+def build_payload_for_zap(city: Optional[str], neighborhood: Optional[str], area_min: Optional[int], area_max: Optional[int], page: int = 1, size: int = 50) -> dict:
     """
-    Tenta obter os anúncios diretamente da API 'glue-api.zapimoveis.com.br'.
-    O endpoint e parâmetros podem variar com o tempo — este método tenta uma chamada comum
-    para resultados de listagem de apartamentos para venda.
-    Retorna lista de objetos de anúncio (bruto) ou [].
+    Build a filter payload for Zap glue API.
+    This payload is heuristic-based (observed patterns). It aims to request apartments for sale.
     """
-    parsed = urlparse(listings_page)
-    domain = parsed.netloc.lower()
-    # Só aplicamos esta estratégia para zapimoveis.com.br
-    if "zapimoveis.com.br" not in domain:
-        return []
+    payload = {
+        "business": ["SALE"],
+        "category": ["APARTMENT"],
+        "page": page - 1,  # some endpoints use 0-index pages
+        "size": size,
+        "filters": []
+    }
 
-    # Construir uma request para o endpoint glue-api (heurística conhecida)
-    # Parâmetros comuns: business=SALE (venda), category=APARTMENT
-    size = max(20, min(max_items, 200))
-    api_url = f"https://glue-api.zapimoveis.com.br/v3/listings?business=SALE&category=APARTMENT&page=1&size={size}"
+    # city / neighborhood mapping via address filters if provided
+    if city:
+        payload.setdefault("filters", []).append({
+            "name": "addressCity",
+            "value": [city]
+        })
+    if neighborhood:
+        payload.setdefault("filters", []).append({
+            "name": "addressNeighborhood",
+            "value": [neighborhood]
+        })
+    # area range
+    if area_min or area_max:
+        # Zap sometimes expects range filters with names like 'usableArea'
+        range_filter = {"name": "usableArea", "range": {}}
+        if area_min:
+            range_filter["range"]["min"] = int(area_min)
+        if area_max:
+            range_filter["range"]["max"] = int(area_max)
+        payload.setdefault("filters", []).append(range_filter)
 
-    # Algumas variações usam query params diferentes; tentamos também sem category
-    candidates = [api_url,
-                  f"https://glue-api.zapimoveis.com.br/v3/listings?business=SALE&page=1&size={size}"]
+    return payload
 
-    for url in candidates:
-        try:
-            resp = safe_get(url, timeout=timeout, extra_headers={"Referer": listings_page})
-            if not resp:
-                continue
-            j = resp.json()
-            # estrutura esperada: j["content"] ou j["listings"] ou j["data"]
-            data = j.get("content") or j.get("listings") or j.get("data") or j
-            # normalizar para lista de items
-            if isinstance(data, dict) and "listings" in data:
-                items = data["listings"]
-            elif isinstance(data, dict) and "content" in data:
-                items = data["content"]
-            elif isinstance(data, list):
-                items = data
-            elif isinstance(data, dict) and "results" in data:
-                items = data["results"]
-            else:
-                # procurar keys que parecem anúncios (cada valor que é lista de dicts)
-                items = []
-                for v in data.values() if isinstance(data, dict) else []:
-                    if isinstance(v, list) and v and isinstance(v[0], dict):
-                        items = v
-                        break
-            # Filtrar itens válidos
-            if items and isinstance(items, list):
-                logger.info(f"Zap glue API returned {len(items)} items from {url}")
-                return items[:max_items]
-        except Exception as e:
-            logger.debug(f"Zap API attempt failed for {url}: {e}")
-            continue
-    return []
-
-def extract_listing_from_json(item: Dict[str,Any]) -> Dict[str,Any]:
+def extract_listing_from_zap_item(item: Dict[str,Any]) -> Dict[str,Any]:
     """
-    Extrai campos do objeto JSON retornado pelo API do Zap (ou similares).
-    Mapeia de forma defensiva para os campos desejados:
-    Endereço, Valor, Condominio, IPTU, M2, Quartos, Suites, vaga, Link
+    Defensive mapping of API item to the requested schema fields.
     """
     out = {"Endereço": None, "Valor": None, "Condominio": None, "IPTU": None,
-           "M2": None, "Quartos": None, "Suites": None, "vaga": None, "Link": None}
-    # Estruturas comuns: item may contain 'address', 'price', 'condominiumFee', 'iptuFee', 'usableArea', 'bedrooms','suites','parkingSpaces','url'
-    # Adaptar com muitos possíveis nomes
-    def get_any(d, *keys):
+           "M2": None, "Quartos": None, "Suites": None, "Vagas": None, "Link": None}
+
+    def g(*keys):
         for k in keys:
-            v = d.get(k) if isinstance(d, dict) else None
-            if v is not None:
-                return v
+            if isinstance(item, dict) and k in item and item[k] is not None:
+                return item[k]
         return None
 
-    # Link
-    out["Link"] = get_any(item, "link", "url", "absoluteUrl", "listingUrl")
-    # Address: may be nested
-    address = get_any(item, "address", "place", "location", "addressLocation")
-    if isinstance(address, dict):
+    # common fields
+    # Link/url
+    link = g("absoluteUrl", "url", "link", "listingUrl")
+    if link:
+        out["Link"] = link if link.startswith("http") else ("https://www.zapimoveis.com.br" + link)
+
+    # Price - various shapes
+    price_obj = g("price", "businessPrice", "priceSpecification", "pricing", "value")
+    if isinstance(price_obj, dict):
+        p = price_obj.get("value") or price_obj.get("amount") or price_obj.get("price")
+        if p is not None:
+            out["Valor"] = f"R$ {p}"
+    elif price_obj is not None:
+        out["Valor"] = str(price_obj)
+
+    # condo / iptu
+    condo = g("condominiumFee", "condominium", "condominiumFeeFormatted")
+    if condo:
+        out["Condominio"] = str(condo)
+    iptu = g("iptuFee", "iptu", "iptuFormatted")
+    if iptu:
+        out["IPTU"] = str(iptu)
+
+    # area
+    area = g("usableArea", "floorArea", "area", "size")
+    if isinstance(area, dict):
+        av = area.get("value") or area.get("amount") or area.get("size")
+        if av:
+            out["M2"] = str(av)
+    elif area is not None:
+        out["M2"] = str(area)
+
+    # bedrooms, suites, parking
+    beds = g("bedrooms", "bedroom", "numberBedrooms")
+    if beds is not None:
+        out["Quartos"] = str(beds)
+    suites = g("suites", "suitesNumber", "numberOfSuites")
+    if suites is not None:
+        out["Suites"] = str(suites)
+    parking = g("parkingSpaces", "parking", "parkingSpots", "carSpaces")
+    if parking is not None:
+        out["Vagas"] = str(parking)
+
+    # address: item may include structured address
+    addr = g("address", "location", "addressLocation", "place")
+    if isinstance(addr, dict):
         parts = []
-        for k in ("street", "streetName", "streetAddress", "fullAddress", "address"):
-            v = address.get(k) or address.get(k.lower())
+        for k in ("street", "streetAddress", "streetName", "address", "fullAddress"):
+            v = addr.get(k) or addr.get(k.lower())
             if v:
                 parts.append(str(v))
-        # locality
-        for k in ("neighborhood", "city", "state", "postalCode"):
-            v = address.get(k)
+        for k in ("neighborhood", "city", "state"):
+            v = addr.get(k)
             if v:
                 parts.append(str(v))
         if parts:
             out["Endereço"] = ", ".join(parts)
-    elif isinstance(address, str):
-        out["Endereço"] = address
+    elif isinstance(addr, str):
+        out["Endereço"] = addr
 
-    # Price
-    price = get_any(item, "price", "businessPrice", "priceValue", "value")
-    if isinstance(price, dict):
-        p = price.get("amount") or price.get("value") or price.get("price")
-        if p is not None:
-            out["Valor"] = f"R$ {p}"
-    elif price is not None:
-        # numeric or string
-        out["Valor"] = str(price)
+    # fallback: try 'title' or 'headline'
+    if not out["Endereço"]:
+        title = g("title", "headline", "name")
+        if title:
+            out["Endereço"] = str(title)
 
-    # Condomínio / IPTU
-    condo = get_any(item, "condominiumFee", "condominium", "condominium_value", "condominiumPrice")
-    if condo:
-        out["Condominio"] = str(condo)
-    iptu = get_any(item, "iptu", "iptuFee", "iptu_value")
-    if iptu:
-        out["IPTU"] = str(iptu)
-
-    # Area
-    area = get_any(item, "usableArea", "area", "buildingArea", "floorArea", "size")
-    if isinstance(area, dict):
-        area_val = area.get("value") or area.get("amount")
-        if area_val:
-            out["M2"] = str(area_val)
-    elif area is not None:
-        out["M2"] = str(area)
-
-    # Bedrooms / suites / parking
-    bed = get_any(item, "bedrooms", "bedroom", "numberBedrooms")
-    if bed is not None:
-        out["Quartos"] = str(bed)
-    suites = get_any(item, "suites", "suitesNumber", "numberOfSuites")
-    if suites is not None:
-        out["Suites"] = str(suites)
-    park = get_any(item, "parkingSpaces", "parking", "parkingSpots", "parkingSlots")
-    if park is not None:
-        out["vaga"] = str(park)
-
-    # fallback: try to find within nested 'characteristics' or 'details' list
-    chars = get_any(item, "characteristics", "features", "amenities", "details")
-    if isinstance(chars, list):
-        # search patterns like "2 quartos", "1 vaga", "64 m²"
-        text = " ".join([str(c) for c in chars])
-        if not out["Quartos"]:
-            m = re.search(r"(\d+)\s+quartos?", text, re.I)
-            if m:
-                out["Quartos"] = m.group(1)
-        if not out["Suites"]:
-            m = re.search(r"(\d+)\s+su[ií]tes?", text, re.I)
-            if m:
-                out["Suites"] = m.group(1)
-        if not out["vaga"]:
-            m = re.search(r"(\d+)\s+vagas?", text, re.I)
-            if m:
-                out["vaga"] = m.group(1)
-        if not out["M2"]:
-            m = re.search(r"(\d{2,4}(?:[.,]\d{1,2})?)\s*(m2|m²)", text, re.I)
-            if m:
-                out["M2"] = m.group(1)
-
-    # final tidy: strip and normalize
+    # normalize whitespace
     for k,v in out.items():
         if isinstance(v, str):
             out[k] = re.sub(r"\s+", " ", v).strip()
+
     return out
 
-# Fallback: generic link gathering (if API not available)
+# Fallback HTML heuristics (lightweight)
 def gather_listing_links_generic(listings_page: str, max_links: int = 50, timeout: int = 20) -> List[str]:
     resp = safe_get(listings_page, timeout=timeout)
     if not resp:
@@ -241,7 +212,7 @@ def gather_listing_links_generic(listings_page: str, max_links: int = 50, timeou
         href = a["href"].strip()
         if href.startswith("#") or href.lower().startswith("javascript"):
             continue
-        full = urljoin(base, href)
+        full = href if href.startswith("http") else (base.rstrip("/") + "/" + href.lstrip("/"))
         parsed = urlparse(full)
         if parsed.scheme not in ("http", "https"):
             continue
@@ -260,7 +231,37 @@ def gather_listing_links_generic(listings_page: str, max_links: int = 50, timeou
             break
     return links
 
-# Excel writer
+def parse_listing_page_basic(link: str, timeout: int = 20) -> Dict[str,Any]:
+    parsed = {"Endereço": None, "Valor": None, "Condominio": None, "IPTU": None, "M2": None, "Quartos": None, "Suites": None, "Vagas": None, "Link": link}
+    resp = safe_get(link, timeout=timeout)
+    if not resp:
+        return parsed
+    soup = BeautifulSoup(resp.text, "lxml")
+    text = soup.get_text(separator="\n", strip=True)
+    price_match = re.search(r"(R\$\s?[\d\.,]+)", text)
+    if price_match:
+        parsed["Valor"] = price_match.group(1)
+    area_match = re.search(r"(\d{2,4}(?:[.,]\d{1,2})?)\s*(m2|m²)", text, re.I)
+    if area_match:
+        parsed["M2"] = area_match.group(1)
+    q_match = re.search(r"(\d+)\s+quartos?", text, re.I)
+    if q_match:
+        parsed["Quartos"] = q_match.group(1)
+    s_match = re.search(r"(\d+)\s+su[ií]tes?", text, re.I)
+    if s_match:
+        parsed["Suites"] = s_match.group(1)
+    v_match = re.search(r"(\d+)\s+vagas?", text, re.I)
+    if v_match:
+        parsed["Vagas"] = v_match.group(1)
+    addr_tag = soup.find("address")
+    if addr_tag:
+        parsed["Endereço"] = addr_tag.get_text(" ", strip=True)
+    else:
+        m = re.search(r"Endere[cç]o[:\s]*([^\n\r]+)", text, re.I)
+        if m:
+            parsed["Endereço"] = m.group(1).strip()
+    return parsed
+
 def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "listings") -> bytes:
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
@@ -271,20 +272,24 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "listings") -> bytes:
 # -------------------------
 # UI
 # -------------------------
-st.title("🏠 Zap Imóveis — Extração via API (recomendada)")
+st.title("🏠 Zap Imóveis — Extração via POST (API)")
 st.markdown(
-    "Cole a URL da página de listagens do Zap Imóveis (ex.: resultados de busca). "
-    "O app tentará primeiro usar a API pública (glue-api) para extrair anúncios; "
-    "se não for possível, usará heurística de links e raspagem direta."
+    "Cole a URL da página de listagens do Zap Imóveis (por ex.: resultados de busca). "
+    "O app fará uma chamada POST para a API do Zap com filtros (cidade/bairro/área) e tentará retornar os anúncios."
 )
 
-col1, col2 = st.columns([3,1])
-with col1:
+col_main, col_side = st.columns([3,1])
+with col_main:
     listings_url = st.text_input("URL da página de listagens (Zap Imóveis)", value=st.session_state.get("last_listings_url",""))
-    max_links = st.number_input("Máx de anúncios a seguir", min_value=5, max_value=500, value=int(st.session_state.settings["max_listing_links"]))
-    timeout_sec = st.number_input("Timeout (s) por requisição", min_value=5, max_value=60, value=int(st.session_state.settings["timeout_sec"]))
-with col2:
-    run_btn = st.button("Extrair anúncios (API-primeiro)")
+    city = st.text_input("Cidade (opcional) — ex: São Paulo", value="")
+    neighborhood = st.text_input("Bairro (opcional) — ex: Pinheiros", value="")
+    area_min = st.number_input("Área mínima (m², opcional)", min_value=0, value=0, step=1)
+    area_max = st.number_input("Área máxima (m², opcional)", min_value=0, value=0, step=1)
+    max_results = st.number_input("Máx resultados (total)", min_value=10, max_value=1000, value=int(st.session_state.settings["max_results"]))
+    page_size = st.number_input("Tamanho da página (page size)", min_value=10, max_value=200, value=int(st.session_state.settings["page_size"]))
+with col_side:
+    run_btn = st.button("Extrair via API POST")
+    fallback_btn = st.button("Forçar heurística HTML")
     clear_btn = st.button("Limpar resultados")
 
 if clear_btn:
@@ -296,111 +301,140 @@ if run_btn:
         st.error("Cole a URL da página de listagens antes de rodar.")
     else:
         st.session_state["last_listings_url"] = listings_url
-        with st.spinner("Tentando API do Zap..."):
-            items = try_zap_glue_api(listings_url, max_items=max_links, timeout=timeout_sec)
-        results = []
-        if items:
-            st.info(f"API do Zap retornou {len(items)} itens — extraindo campos.")
-            progress = st.progress(0)
-            for i, it in enumerate(items[:max_links], start=1):
-                try:
-                    parsed = extract_listing_from_json(it if isinstance(it, dict) else dict(it))
-                except Exception as e:
-                    logger.exception("Erro extraindo item JSON")
-                    parsed = {"Endereço": None, "Valor": None, "Condominio": None, "IPTU": None,
-                              "M2": None, "Quartos": None, "Suites": None, "vaga": None, "Link": None}
-                results.append(parsed)
-                progress.progress(int(i/len(items) * 100))
-            progress.empty()
-        else:
-            # fallback to generic scraping
-            st.warning("API do Zap não retornou itens — tentando heurística de links e raspagem HTML.")
-            with st.spinner("Coletando links de anúncios (heurística)..."):
-                links = gather_listing_links_generic(listings_url, max_links=max_links, timeout=timeout_sec)
-            if not links:
-                st.error("Nenhum link de anúncio encontrado com heurística — o site provavelmente carrega via JS. "
-                         "Se quiser, podemos usar Playwright (renderização) ou você pode fornecer um exemplo de anúncio para adaptar seletores.")
-            else:
-                st.info(f"{len(links)} links coletados — iniciando extração de páginas individuais.")
-                progress = st.progress(0)
-                for i, link in enumerate(links[:max_links], start=1):
-                    # reuse the robust 'parse_listing_page' extraction heuristics from prior version (lightweight)
-                    parsed = {"Endereço": None, "Valor": None, "Condominio": None, "IPTU": None,
-                              "M2": None, "Quartos": None, "Suites": None, "vaga": None, "Link": link}
-                    resp = safe_get(link, timeout=timeout_sec)
-                    if resp:
+        # Build payload
+        payload = build_payload_for_zap(city=city or None,
+                                        neighborhood=neighborhood or None,
+                                        area_min=(area_min if area_min>0 else None),
+                                        area_max=(area_max if area_max>0 else None),
+                                        page=1,
+                                        size=int(page_size))
+        st.info("Enviando requisição POST para glue-api.zapimoveis.com.br ...")
+        with st.spinner("Chamando API do Zap (POST)..."):
+            api_url = "https://glue-api.zapimoveis.com.br/v3/listings"
+            resp = safe_post(api_url, json_payload=payload, timeout=int(st.session_state.settings["timeout_sec"]))
+        results: List[Dict[str,Any]] = []
+        if resp:
+            try:
+                j = resp.json()
+                # normalize possible containers
+                items = j.get("content") or j.get("listings") or j.get("data") or j.get("results") or j.get("hits") or j
+                # If paginated wrapper
+                if isinstance(items, dict) and "content" in items:
+                    items = items["content"]
+                if isinstance(items, dict) and "listings" in items:
+                    items = items["listings"]
+                if isinstance(items, dict) and "data" in items and isinstance(items["data"], list):
+                    items = items["data"]
+                # items should be list-like
+                if isinstance(items, list) and items:
+                    st.success(f"API retornou {len(items)} itens. Extraindo campos...")
+                    max_take = min(int(max_results), len(items))
+                    progress = st.progress(0)
+                    for i, it in enumerate(items[:max_take], start=1):
                         try:
-                            soup = BeautifulSoup(resp.text, "lxml")
-                            text = soup.get_text(separator="\n", strip=True)
-                            # basic regex extraction
-                            price_match = re.search(r"(R\$\s?[\d\.,]+)", text)
-                            if price_match:
-                                parsed["Valor"] = price_match.group(1)
-                            area_match = re.search(r"(\d{2,4}(?:[.,]\d{1,2})?)\s*(m2|m²)", text, re.I)
-                            if area_match:
-                                parsed["M2"] = area_match.group(1)
-                            q_match = re.search(r"(\d+)\s+quartos?", text, re.I)
-                            if q_match:
-                                parsed["Quartos"] = q_match.group(1)
-                            s_match = re.search(r"(\d+)\s+su[ií]tes?", text, re.I)
-                            if s_match:
-                                parsed["Suites"] = s_match.group(1)
-                            v_match = re.search(r"(\d+)\s+vagas?", text, re.I)
-                            if v_match:
-                                parsed["vaga"] = v_match.group(1)
-                            # address
-                            addr_tag = soup.find("address")
-                            if addr_tag:
-                                parsed["Endereço"] = addr_tag.get_text(" ", strip=True)
-                            else:
-                                # search label
-                                m = re.search(r"Endere[cç]o[:\s]*([^\n\r]+)", text, re.I)
-                                if m:
-                                    parsed["Endereço"] = m.group(1).strip()
+                            parsed = extract_listing_from_zap_item(it if isinstance(it, dict) else dict(it))
                         except Exception:
-                            logger.exception("Erro parsing individual page")
+                            logger.exception("Erro extraindo item JSON")
+                            parsed = {"Endereço": None, "Valor": None, "Condominio": None, "IPTU": None,
+                                      "M2": None, "Quartos": None, "Suites": None, "Vagas": None, "Link": None}
+                        results.append(parsed)
+                        progress.progress(int(i/max_take*100))
+                    progress.empty()
+                else:
+                    st.warning("A API respondeu, mas não retornou uma lista de anúncios no payload padrão.")
+                    # put full JSON in diagnostics
+                    st.code(json.dumps(j, indent=2, ensure_ascii=False)[:5000])
+            except Exception as e:
+                logger.exception("Erro lendo JSON retornado pela API")
+                st.error(f"Falha ao processar JSON da API: {e}")
+        else:
+            st.warning("A API não respondeu (resp é None) ou retornou erro. Irei tentar heurística de links HTML.")
+
+        # fallback to heuristics if no results
+        if not results:
+            st.info("Tentando heurística genérica de links (HTML scraping)...")
+            links = gather_listing_links_generic(listings_url, max_links=int(max_results), timeout=int(st.session_state.settings["timeout_sec"]))
+            if not links:
+                st.error("Nenhum link de anúncio encontrado com heurística — o site provavelmente carrega via JS. Podemos usar Playwright (renderização) se quiser.")
+            else:
+                st.info(f"{len(links)} links encontrados — extraindo páginas individuais.")
+                progress = st.progress(0)
+                for i, link in enumerate(links[:int(max_results)], start=1):
+                    parsed = parse_listing_page_basic(link, timeout=int(st.session_state.settings["timeout_sec"]))
                     results.append(parsed)
-                    progress.progress(int(i/len(links) * 100))
+                    progress.progress(int(i/len(links)*100))
                 progress.empty()
 
-        # Prepare DataFrame and export
+        # Finalize DataFrame
         if results:
             df = pd.DataFrame(results)
-            # ensure columns in requested order
-            cols = ["Endereço","Valor","Condominio","IPTU","M2","Quartos","Suites","vaga","Link"]
+            # ensure columns exist & order
+            cols = ["Endereço","Valor","Condominio","IPTU","M2","Quartos","Suites","Vagas","Link"]
             for c in cols:
                 if c not in df.columns:
                     df[c] = None
             df = df[cols]
             st.session_state["listings_df"] = df
-            st.success(f"Extração concluída: {len(df)} anúncios.")
+            st.success(f"Extração finalizada: {len(df)} registros.")
         else:
             st.warning("Nenhum anúncio extraído.")
 
-# Show results if present
+if fallback_btn:
+    # Force heuristic without attempting API
+    st.session_state["last_listings_url"] = st.session_state.get("last_listings_url","")
+    url = st.session_state.get("last_listings_url","")
+    if not url:
+        st.error("Defina a URL antes de forçar heurística.")
+    else:
+        links = gather_listing_links_generic(url, max_links=int(st.session_state.settings["max_results"]), timeout=int(st.session_state.settings["timeout_sec"]))
+        results = []
+        if not links:
+            st.error("Nenhum link encontrado com heurística.")
+        else:
+            progress = st.progress(0)
+            for i, link in enumerate(links, start=1):
+                parsed = parse_listing_page_basic(link, timeout=int(st.session_state.settings["timeout_sec"]))
+                results.append(parsed)
+                progress.progress(int(i/len(links)*100))
+            progress.empty()
+        if results:
+            df = pd.DataFrame(results)
+            cols = ["Endereço","Valor","Condominio","IPTU","M2","Quartos","Suites","Vagas","Link"]
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = None
+            df = df[cols]
+            st.session_state["listings_df"] = df
+            st.success(f"Extração heurística concluída: {len(df)} registros.")
+
+# Result display / download
 if st.session_state.get("listings_df") is not None:
     df_out: pd.DataFrame = st.session_state["listings_df"]
     st.markdown("### Resultados (pré-visualização)")
     st.dataframe(df_out.head(200))
 
-    # Download button
     excel_bytes = df_to_excel_bytes(df_out)
     ts_fname = datetime.now().strftime("%Y%m%d-%H%M%S")
-    fname = f"anuncios_zap_{ts_fname}.xlsx"
+    fname = f"anuncios_zap_post_{ts_fname}.xlsx"
     st.download_button("Baixar Excel com anúncios", data=excel_bytes, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # Diagnostics / tips
 with st.expander("Diagnóstico e dicas"):
-    st.write("Dicas para melhorar extração:")
-    st.write("- A API do Zap (glue-api) é o caminho ideal: rápido e estruturado. Caso a API mude, adaptaremos os parâmetros.")
-    st.write("- Se o site bloquear o acesso, considere usar token/headers adequados ou Playwright para renderizar o JS.")
-    st.write("- Se quiser precisão absoluta para um portal específico, envie 1 URL de anúncio e eu adapto os seletores.")
+    st.write("Dicas e diagnóstico:")
+    st.write("- Caso a API não responda, cole aqui a URL completa da listagem e eu ajusto o payload (pode ser necessário incluir filtros adicionais).")
+    st.write("- Se o Zap bloquear, podemos simular cabeçalhos extras; em último caso, usamos Playwright (renderização).")
+    st.write("- Se quiser precisão máxima, envie 1 URL de anúncio e eu adapto os campos com seletores específicos.")
     st.write("")
-    st.write("Config atual:")
     st.json({
         "last_listings_url": st.session_state.get("last_listings_url",""),
-        "max_listing_links": int(max_links) if 'max_links' in locals() else st.session_state.settings["max_listing_links"],
-        "timeout_sec": int(timeout_sec) if 'timeout_sec' in locals() else st.session_state.settings["timeout_sec"],
+        "city": city,
+        "neighborhood": neighborhood,
+        "area_min": int(area_min) if area_min else None,
+        "area_max": int(area_max) if area_max else None,
+        "max_results": int(max_results),
+        "page_size": int(page_size),
+        "timeout_sec": int(st.session_state.settings["timeout_sec"])
     })
 
-st.caption("Este aplicativo tenta API-first (Zap glue-api) e decai para heurísticas de scraping quando necessário. Se quiser que seja 100% robusto para um portal, me envie uma URL de exemplo que eu adapto.") 
+st.caption("Este app tenta uso API-first (POST) ao Glue API do Zap; caso não responda, usa heurística HTML como fallback. Se quiser que eu ajuste filtros ou headers, cole um exemplo de URL e eu adapto.")
+

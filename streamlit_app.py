@@ -1,16 +1,17 @@
 # streamlit_app.py
-# Scraper adaptado para QuintoAndar (melhor esforço): extrai resultados de busca (listings) e gera Excel
+# QuintoAndar-specific scraper: JSON-first extraction from __NEXT_DATA__ or window.__NEXT_DATA__
 import re
 import json
 import logging
+import time
 from io import BytesIO
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urljoin, urlencode, parse_qs, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qs, urlencode
 
 import streamlit as st
 
-# MUST be the first Streamlit command
+# set_page_config MUST be first Streamlit command
 st.set_page_config(page_title="QuintoAndar → Listings → Excel", page_icon="🏘️", layout="centered")
 
 import requests
@@ -21,317 +22,228 @@ from pydantic import BaseModel, Field, PositiveInt
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("qa-listings-scraper")
 
-# ------------------------
-# Settings & session_state
-# ------------------------
+# -------------------------
+# App settings & session
+# -------------------------
 class AppSettings(BaseModel):
     max_pages: PositiveInt = Field(default=5)
-    per_request_delay_sec: float = Field(default=0.5)
+    per_request_delay_sec: float = Field(default=0.6)
 
 if "settings" not in st.session_state:
     st.session_state.settings = AppSettings().dict()
 else:
-    # normalize
-    try:
-        defaults = AppSettings().dict()
-        for k, v in defaults.items():
-            if k not in st.session_state.settings:
-                st.session_state.settings[k] = v
-    except Exception:
-        st.session_state.settings = AppSettings().dict()
+    # normalize defaults
+    defaults = AppSettings().dict()
+    for k, v in defaults.items():
+        if k not in st.session_state.settings:
+            st.session_state.settings[k] = v
 
-if "scrape_df" not in st.session_state:
-    st.session_state.scrape_df = None
 if "scrape_url" not in st.session_state:
     st.session_state.scrape_url = ""
+if "scrape_df" not in st.session_state:
+    st.session_state.scrape_df = None
 if "last_raw_sample" not in st.session_state:
-    st.session_state.last_raw_sample = None  # for diagnostics
+    st.session_state.last_raw_sample = None
 
-# ------------------------
-# Helpers: normalization
-# ------------------------
-money_rx = re.compile(r"[\d\.\s]*\d+[,\.]?\d*", re.UNICODE)
-m2_rx = re.compile(r"(\d{1,4})\s*(?:m²|m2|m\^2)", re.IGNORECASE)
-rooms_rx = re.compile(r"(\d+)\s*(quartos|qtos|dormit[oó]rios|dormit[oó]rio)", re.IGNORECASE)
-suite_rx = re.compile(r"(\d+)\s*(su[ií]tes?|su[ií]te)", re.IGNORECASE)
-vaga_rx = re.compile(r"(\d+)\s*(vagas?|vaga)", re.IGNORECASE)
+# -------------------------
+# Normalizers / helpers
+# -------------------------
+money_rx = re.compile(r"[Rr]\$?\s*[\d\.\,kKmM\s]+")
+m2_rx = re.compile(r"(\d{1,4})\s*(?:m²|m2|m\^2)?", re.IGNORECASE)
 
-def parse_money_to_int(s: Optional[str]) -> Optional[int]:
-    if not s:
+def now_utc_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def parse_money_to_int(value: Optional[Any]) -> Optional[int]:
+    if value is None:
         return None
-    # remove R$, spaces, thousands separators; treat comma as decimal separator
-    s = str(s)
+    s = str(value)
+    # handle numeric types
+    if isinstance(value, (int, float)):
+        return int(round(float(value)))
+    # remove currency symbols and letters
     s = s.replace("R$", "").replace("r$", "").strip()
-    # keep numbers, dots and commas
     s = re.sub(r"[^\d\,\.]", "", s)
     if not s:
         return None
-    # if contains comma and dot, remove thousands separators
-    if "," in s and "." in s:
-        # assume format 1.234.567,89 -> remove dots, replace comma with dot
+    # unify thousands and decimals: if both present, assume '.' thousands and ',' decimal
+    if "." in s and "," in s and s.rfind(",") > s.rfind("."):
         s = s.replace(".", "").replace(",", ".")
     else:
-        # remove dots as thousands separator
-        s = s.replace(".", "")
-        s = s.replace(",", ".")
+        s = s.replace(".", "").replace(",", ".")
     try:
-        val = float(s)
-        return int(round(val))
-    except Exception:
-        # fallback: extract digits
+        return int(round(float(s)))
+    except:
         digits = re.sub(r"[^\d]", "", s)
         return int(digits) if digits else None
 
-def parse_m2_to_int(s: Optional[str]) -> Optional[int]:
-    if not s:
+def parse_m2_to_int(value: Optional[Any]) -> Optional[int]:
+    if value is None:
         return None
-    if isinstance(s, (int, float)):
-        return int(s)
-    m = m2_rx.search(str(s))
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value)
+    m = m2_rx.search(s)
     if m:
         try:
             return int(m.group(1))
         except:
-            return None
-    # fallback: digits
-    d = re.findall(r"\d{1,4}", s)
-    return int(d[0]) if d else None
+            pass
+    digits = re.findall(r"\d{1,4}", s)
+    return int(digits[0]) if digits else None
 
-def parse_int_from_text(s: Optional[str]) -> Optional[int]:
-    if not s:
+def parse_int(value: Optional[Any]) -> Optional[int]:
+    if value is None:
         return None
-    d = re.search(r"(\d+)", str(s))
-    return int(d.group(1)) if d else None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = re.search(r"(\d+)", str(value))
+    return int(s.group(1)) if s else None
 
-def now_isoutc():
-    return datetime.now(timezone.utc).isoformat()
-
-# ------------------------
-# Helpers: URL / pagination
-# ------------------------
-def build_page_url(base_url: str, page_index: int) -> str:
-    """
-    Attempt to create a paginated URL. QuintoAndar often uses query params for pagination.
-    Strategy:
-      - If URL already has 'page' or 'pagina' param, replace it.
-      - Else append '?page=2' (or '&page=2' if ? already exists).
-    """
+# -------------------------
+# URL pagination helper
+# -------------------------
+def build_page_url(base_url: str, page: int) -> str:
+    # try to replace common pagination query params
     try:
         parts = list(urlsplit(base_url))
         qs = parse_qs(parts[3])
+        # QuintoAndar sometimes uses 'page' or 'pagina' or 'offset'
         if "page" in qs or "pagina" in qs:
-            qs["page"] = [str(page_index)]
+            qs["page"] = [str(page)]
             parts[3] = urlencode(qs, doseq=True)
             return urlunsplit(parts)
-        # some sites use ?pagina=2 or ?pagina=1; add page param
-        if "?" in base_url:
-            return base_url + "&page=" + str(page_index)
+        # else add page param
+        if parts[3]:
+            parts[3] = parts[3] + "&page=" + str(page)
         else:
-            return base_url + "?page=" + str(page_index)
+            parts[3] = "page=" + str(page)
+        return urlunsplit(parts)
     except Exception:
-        return base_url
+        if "?" in base_url:
+            return base_url + f"&page={page}"
+        return base_url + f"?page={page}"
 
-# ------------------------
-# JSON extraction helper (for SPA pages)
-# ------------------------
-def try_extract_json_from_scripts(soup: BeautifulSoup) -> Optional[Any]:
-    """
-    Busca por JSON embutido nos <script> da página (heurístico).
-    Retorna o primeiro objeto JSON contendo chaves relacionadas a listings.
-    """
-    scripts = soup.find_all("script")
-    candidate_keys = ["listings", "properties", "searchResults", "houses", "items", "results"]
-    for s in scripts:
+# -------------------------
+# JSON extraction from scripts (__NEXT_DATA__ or window.__NEXT_DATA__)
+# -------------------------
+def extract_json_from_page(html: str) -> Optional[Dict[str, Any]]:
+    soup = BeautifulSoup(html, "lxml")
+    # try script with id __NEXT_DATA__
+    script = soup.find("script", id="__NEXT_DATA__")
+    if script and script.string:
+        try:
+            return json.loads(script.string)
+        except Exception:
+            pass
+    # fallback: search any <script> containing 'window.__NEXT_DATA__' or 'window.__INITIAL_STATE__'
+    for s in soup.find_all("script"):
         text = s.string or s.get_text(" ", strip=True) or ""
-        # heurística: procurar '=' seguido de '{' ou '[' e terminar com ';' ou </script>
-        # extração por regex: capture {...} or [...]
-        # tentamos várias tentativas para não quebrar em JSON inválido
-        # 1) find first '{' or '[' and try to json.loads progressive slices
-        idx = None
-        if "=" in text:
-            # split on '=' and check right side
-            parts = text.split("=", 1)
-            right = parts[1].strip()
-            # try to find first { or [
-            m = re.search(r"([\{\[])", right)
-            if m:
-                start = m.start()
-                # do progressive extraction until a valid JSON is found
-                for end in range(len(right)-1, start+1, -1):
-                    snippet = right[start:end+1].strip().rstrip(";,")
-                    try:
-                        obj = json.loads(snippet)
-                        # check if object contains candidate keys
-                        if isinstance(obj, dict):
-                            keys = " ".join(list(obj.keys())).lower()
-                            if any(k.lower() in keys for k in candidate_keys):
-                                return obj
-                            # also search nested
-                            if contains_listing_like(obj):
-                                return obj
-                        elif isinstance(obj, list):
-                            # list of objects
-                            for item in obj:
-                                if isinstance(item, dict) and contains_listing_like(item):
-                                    return obj
-                    except Exception:
-                        continue
-        # 2) fallback: try to find JSON-looking substring with searchResults word
-        if "searchResults" in text or "listings" in text or "properties" in text:
-            # try to extract JSON by finding first { and last }
+        if "window.__NEXT_DATA__" in text or "window.__INITIAL_STATE__" in text or "searchResults" in text:
+            # try find JSON substring
             try:
-                first = text.index("{")
-                last = text.rindex("}")
-                snippet = text[first:last+1]
-                obj = json.loads(snippet)
-                if contains_listing_like(obj):
-                    return obj
+                # find first { and last } and parse
+                first = text.find("{")
+                last = text.rfind("}")
+                if first != -1 and last != -1 and last > first:
+                    snippet = text[first:last+1]
+                    return json.loads(snippet)
             except Exception:
                 continue
     return None
 
-def contains_listing_like(obj: Any) -> bool:
-    """
-    Heurística simples: check if object or nested contains price/valor/link keys.
-    """
-    if isinstance(obj, dict):
-        keys = " ".join(obj.keys()).lower()
-        if any(k in keys for k in ["price", "valor", "priceLabel", "listing", "property", "link", "slug", "id"]):
-            return True
-        for v in obj.values():
-            if contains_listing_like(v):
-                return True
-    elif isinstance(obj, list):
-        for it in obj:
-            if contains_listing_like(it):
-                return True
-    return False
-
-# ------------------------
-# Recursive finder for listing dicts
-# ------------------------
-def find_listing_dicts(obj: Any) -> List[Dict[str, Any]]:
+def find_listing_objects(obj: Any) -> List[Dict[str, Any]]:
     found = []
     if isinstance(obj, dict):
-        # candidate: has price or valor and has some url/id
-        lowkeys = {k.lower(): v for k, v in obj.items()}
-        if any(k in lowkeys for k in ["price", "valor", "priceLabel"]) and any(k in lowkeys for k in ["url", "link", "slug", "id", "path"]):
+        keys = {k.lower(): v for k, v in obj.items()}
+        # heuristic: object representing listing likely has 'id' or 'houseId' and some price/value fields
+        if any(k in keys for k in ("id", "listingid", "houseid", "propertyid")) and any(k in keys for k in ("price", "valor", "priceinfo", "pricing")):
             found.append(obj)
-        # also if has 'results' or 'listings' keys inspect them
-        for k, v in obj.items():
-            found += find_listing_dicts(v)
+        # search nested
+        for v in obj.values():
+            found += find_listing_objects(v)
     elif isinstance(obj, list):
         for item in obj:
-            found += find_listing_dicts(item)
+            found += find_listing_objects(item)
     return found
 
-# ------------------------
-# Extract from JSON listing dict (best-effort mapping)
-# ------------------------
-def extract_from_listing_dict(d: Dict[str, Any], base_url: str) -> Dict[str, Optional[Any]]:
-    # flatten keys to search
-    js = json.dumps(d)
-    # link detection
+# -------------------------
+# Map JSON listing -> normalized row
+# -------------------------
+def map_listing_json_to_row(d: Dict[str, Any], base_url: str) -> Dict[str, Any]:
+    # common key names on QuintoAndar JSON structure (best-effort)
+    # link
     link = None
-    for candidate in ("url", "link", "slug", "path", "permalink"):
-        if candidate in d and d[candidate]:
-            link = d[candidate]
-            break
-    # sometimes nested
+    if "link" in d and d["link"]:
+        link = d["link"]
     if not link:
-        for k, v in d.items():
-            if isinstance(v, str) and v.startswith("/imovel"):
-                link = v
-                break
-    if link:
+        for k in ("url", "permalink", "slug", "path"):
+            if k in d and d[k]:
+                link = d[k]; break
+    if link and not link.startswith("http"):
         link = urljoin(base_url, link)
     # address
     address = None
-    for candidate in ("address", "endereco", "location", "displayAddress", "formattedAddress"):
-        if candidate in d and d[candidate]:
-            address = d[candidate]
-            break
-    # price
-    valor = None
-    for candidate in ("price", "valor", "listedPrice", "displayPrice"):
-        if candidate in d and d[candidate]:
-            valor = d[candidate]
-            break
-    # condominium
-    cond = None
-    for candidate in ("condominium", "condominio", "condominiumFee", "condo"):
-        if candidate in d and d[candidate]:
-            cond = d[candidate]
-            break
-    # iptu
-    iptu = None
-    for candidate in ("iptu", "propertyTax", "iptuValue"):
-        if candidate in d and d[candidate]:
-            iptu = d[candidate]
-            break
-    # m2
-    m2 = None
-    for candidate in ("area", "usableArea", "m2", "size"):
-        if candidate in d and d[candidate]:
-            m2 = d[candidate]
-            break
-    # rooms
-    quartos = None
-    for candidate in ("bedrooms", "rooms", "quartos", "bedroomCount"):
-        if candidate in d and d[candidate] is not None:
-            quartos = d[candidate]
-            break
-    # suites
-    suites = None
-    for candidate in ("suites", "suiteCount", "bathrooms"):
-        if candidate in d and d[candidate] is not None:
-            suites = d[candidate]
-            break
-    # vagas
-    vagas = None
-    for candidate in ("parkingSpaces", "garage", "vagas", "parking"):
-        if candidate in d and d[candidate] is not None:
-            vagas = d[candidate]
-            break
-    # bairro / cidade attempts
-    bairro = None
-    cidade = None
-    if "city" in d:
-        cidade = d.get("city")
-    if "neighborhood" in d:
-        bairro = d.get("neighborhood")
-    if isinstance(address, str):
-        # try to split "Rua X - Bairro - Cidade"
-        parts = [p.strip() for p in re.split(r"[,\-–—]", address) if p.strip()]
-        if parts:
-            # attempt heuristics
+    rua = None; bairro = None; cidade = None
+    if "address" in d and d.get("address"):
+        address = d.get("address")
+        if isinstance(address, dict):
+            rua = address.get("street") or address.get("logradouro") or address.get("streetAddress") or None
+            bairro = address.get("neighborhood") or address.get("bairro") or None
+            cidade = address.get("city") or address.get("cidade") or None
+            # formatted full
+            if not rua:
+                rua = address.get("formatted") or address.get("display") or None
+        elif isinstance(address, str):
+            addr_text = address
+            parts = [p.strip() for p in re.split(r"[,\-–]", addr_text) if p.strip()]
             if len(parts) >= 3:
-                rua = parts[0]
-                bairro = bairro or parts[1]
-                cidade = cidade or parts[-1]
+                rua = parts[0]; bairro = parts[1]; cidade = parts[-1]
             elif len(parts) == 2:
-                rua = parts[0]
-                bairro = bairro or parts[1]
+                rua = parts[0]; bairro = parts[1]
             else:
-                rua = parts[0]
-        else:
-            rua = address
-    else:
-        rua = None
-
-    # ano de construcao (try common keys)
+                rua = addr_text
+    # valor
+    valor = None
+    for k in ("price", "valor", "salePrice", "listedPrice", "displayPrice"):
+        if k in d and d[k]:
+            valor = d[k]; break
+    # condo / iptu
+    cond = None; iptu = None
+    for k in ("condo", "condominium", "condominiumFee", "condoFee"):
+        if k in d and d[k]:
+            cond = d[k]; break
+    for k in ("iptu", "propertyTax", "tax"):
+        if k in d and d[k]:
+            iptu = d[k]; break
+    # m2 / area
+    m2 = None
+    for k in ("area", "usableArea", "size", "area_m2"):
+        if k in d and d[k]:
+            m2 = d[k]; break
+    # quartos suites vagas
+    quartos = None; suites = None; vagas = None
+    for k in ("bedrooms", "bedroomCount", "quartos"):
+        if k in d and d[k] is not None:
+            quartos = d[k]; break
+    for k in ("suites", "suiteCount", "bathrooms"):
+        if k in d and d[k] is not None:
+            suites = d[k]; break
+    for k in ("parkingSpaces", "garage", "vagas", "parking"):
+        if k in d and d[k] is not None:
+            vagas = d[k]; break
+    # ano de construcao
     ano = None
-    for candidate in ("yearBuilt", "constructionYear", "builtYear", "anoConstrucao", "ano"):
-        if candidate in d and d[candidate]:
+    for k in ("yearBuilt", "constructionYear", "builtYear", "anoConstrucao"):
+        if k in d and d[k]:
             try:
-                ano = int(d[candidate])
-                break
+                ano = int(d[k]); break
             except:
                 pass
-
+    # finalize
     return {
-        "Endereço": address,
-        "RuaAvenida": rua,
+        "Endereço": address or None,
+        "Rua": rua,
         "Bairro": bairro,
         "Cidade": cidade,
         "Valor_raw": str(valor) if valor is not None else None,
@@ -341,25 +253,71 @@ def extract_from_listing_dict(d: Dict[str, Any], base_url: str) -> Dict[str, Opt
         "IPTU_raw": str(iptu) if iptu is not None else None,
         "IPTU": parse_money_to_int(iptu),
         "M2": parse_m2_to_int(m2),
-        "Quartos": parse_int_from_text(quartos),
-        "Suites": parse_int_from_text(suites),
-        "Vaga": parse_int_from_text(vagas),
+        "Quartos": parse_int(quartos),
+        "Suites": parse_int(suites),
+        "Vaga": parse_int(vagas),
         "Link": link,
         "bairro": bairro,
-        "data_coleta": now_isoutc(),
+        "data_coleta": now_utc_iso(),
         "ano_de_construcao": ano
     }
 
-# ------------------------
-# HTML fallback card parser (if JSON not found)
-# ------------------------
-def parse_cards_with_bs(html: str, base_url: str) -> List[Dict[str, Any]]:
+# -------------------------
+# Parse a single search page: JSON-first -> fallback to HTML card parsing
+# -------------------------
+def parse_search_page(url: str) -> List[Dict[str, Any]]:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; QuintoAndarScraper/1.0)", "Accept-Language": "pt-BR,pt;q=0.9"}
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    html = resp.text
+    # keep head sample for diagnostics
+    st.session_state.last_raw_sample = html[:8000]
+    # try JSON extraction
+    json_obj = extract_json_from_page(html)
+    rows = []
+    base_url = resp.url
+    if json_obj:
+        # find candidate listing objects inside json
+        listing_dicts = find_listing_objects(json_obj)
+        if listing_dicts:
+            for d in listing_dicts:
+                row = map_listing_json_to_row(d, base_url)
+                # ignore rows that look like non-listing (e.g., neighborhoods widget)
+                if row.get("Link") or row.get("Valor") or row.get("M2"):
+                    rows.append(row)
+            if rows:
+                return rows
+        # fallback: scan for arrays inside json that contain listing-like dicts
+        # traverse keys to find lists
+        def traverse_for_lists(o):
+            found = []
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if isinstance(v, list):
+                        found.append(v)
+                    else:
+                        found += traverse_for_lists(v)
+            elif isinstance(o, list):
+                for it in o:
+                    found += traverse_for_lists(it)
+            return found
+        lists = traverse_for_lists(json_obj)
+        for lst in lists:
+            for it in lst:
+                if isinstance(it, dict):
+                    candidate = find_listing_objects(it)
+                    if candidate:
+                        for d in candidate:
+                            row = map_listing_json_to_row(d, base_url)
+                            if row.get("Link") or row.get("Valor"):
+                                rows.append(row)
+        if rows:
+            return rows
+    # HTML fallback: parse candidate cards with BeautifulSoup (less reliable)
     soup = BeautifulSoup(html, "lxml")
-    cards = []
-    # find probable item containers
-    candidates = soup.select("[class*='listing'], [class*='card'], [class*='result'], [class*='property'], li, article")
+    cards = soup.select("[data-testid*='property-card'], [class*='listing'], [class*='card'], [class*='result'], li, article")
     seen = set()
-    for c in candidates:
+    for c in cards:
         text = c.get_text(" ", strip=True)
         if len(text) < 40:
             continue
@@ -367,141 +325,104 @@ def parse_cards_with_bs(html: str, base_url: str) -> List[Dict[str, Any]]:
         if key in seen:
             continue
         seen.add(key)
-        # ignore obvious ads
+        # skip neighborhood widgets heuristically
+        if re.search(r"bairros próximos|valor médio|imóveis para comprar|valor médio", text, re.I):
+            continue
+        # skip sponsored markers
         if re.search(r"patrocinad|anúncio|promovido|sponsored|publicidade", text, re.I):
             continue
-        # try extract link
+        # extract link (first anchor)
         a = c.find("a", href=True)
-        link = None
-        if a:
-            link = urljoin(base_url, a.get("href"))
-        # value
-        money_search = re.search(r"R\$\s?[\d\.\,kKmM]+", text)
-        valor = money_search.group(0) if money_search else None
-        # m2
+        link = urljoin(base_url, a.get("href")) if a else None
+        # valor
+        mval = re.search(r"R\$\s?[\d\.\,kKmM]+", text)
+        valor_raw = mval.group(0) if mval else None
+        # condo/iptu heuristics
+        mcond = re.search(r"Condom[ií]nio[:\s]*R?\$?[^\s\,;]+", text, re.I)
+        cond_raw = None
+        if mcond:
+            cond_raw = re.sub(r"Condom[ií]nio[:\s]*", "", mcond.group(0), flags=re.I).strip()
+        miptu = re.search(r"IPTU[:\s]*R?\$?[^\s\,;]+", text, re.I)
+        iptu_raw = None
+        if miptu:
+            iptu_raw = re.sub(r"IPTU[:\s]*", "", miptu.group(0), flags=re.I).strip()
+        # m2, quartos, suites, vagas
         m2 = None
-        m = m2_rx.search(text)
+        m = re.search(r"(\d{1,4})\s*(m²|m2|m\^2)", text, re.I)
         if m:
             m2 = m.group(1)
-        # quartos suites vagas
         quartos = None
-        m = rooms_rx.search(text)
+        m = re.search(r"(\d+)\s*(quartos|dormit[oó]rios|qtos?)", text, re.I)
         if m:
             quartos = m.group(1)
         suites = None
-        m = suite_rx.search(text)
+        m = re.search(r"(\d+)\s*(su[ií]tes?|su[ií]te)", text, re.I)
         if m:
             suites = m.group(1)
         vagas = None
-        m = vaga_rx.search(text)
+        m = re.search(r"(\d+)\s*(vagas?|vaga)", text, re.I)
         if m:
             vagas = m.group(1)
-        # condominio / iptu
-        cond = None
-        m = re.search(r"Condom[ií]nio[:\s]*R?\$?[\s\d\.\,kKmM]+", text, re.I)
-        if m:
-            cond = re.sub(r"Condom[ií]nio[:\s]*", "", m.group(0), flags=re.I).strip()
-        iptu = None
-        m = re.search(r"IPTU[:\s]*R?\$?[\s\d\.\,kKmM]+", text, re.I)
-        if m:
-            iptu = re.sub(r"IPTU[:\s]*", "", m.group(0), flags=re.I).strip()
-        # address heuristic
+        # address heuristics
         address = None
         m = re.search(r"(Rua|Av\.|Avenida|Travessa|Alameda|R\.)\s+[^\n,]{5,80}", text)
         if m:
             address = m.group(0).strip()
-        cards.append({
+        row = {
             "Endereço": address,
-            "RuaAvenida": address,
+            "Rua": address,
             "Bairro": None,
             "Cidade": None,
-            "Valor_raw": valor,
-            "Valor": parse_money_to_int(valor),
-            "Condominio_raw": cond,
-            "Condominio": parse_money_to_int(cond),
-            "IPTU_raw": iptu,
-            "IPTU": parse_money_to_int(iptu),
+            "Valor_raw": valor_raw,
+            "Valor": parse_money_to_int(valor_raw),
+            "Condominio_raw": cond_raw,
+            "Condominio": parse_money_to_int(cond_raw),
+            "IPTU_raw": iptu_raw,
+            "IPTU": parse_money_to_int(iptu_raw),
             "M2": parse_m2_to_int(m2),
-            "Quartos": parse_int_from_text(quartos),
-            "Suites": parse_int_from_text(suites),
-            "Vaga": parse_int_from_text(vagas),
+            "Quartos": parse_int(quartos),
+            "Suites": parse_int(suites),
+            "Vaga": parse_int(vagas),
             "Link": link,
             "bairro": None,
-            "data_coleta": now_isoutc(),
+            "data_coleta": now_utc_iso(),
             "ano_de_construcao": None
-        })
-    return cards
+        }
+        rows.append(row)
+    return rows
 
-# ------------------------
-# Main parse function per page (tries JSON then HTML)
-# ------------------------
-def parse_search_page(url: str) -> List[Dict[str, Any]]:
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; QuintoAndarScraper/1.0)", "Accept-Language": "pt-BR,pt;q=0.9"}
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    html = resp.text
-    soup = BeautifulSoup(html, "lxml")
-    st.session_state.last_raw_sample = {"url": url, "html_head": html[:5000]}
-    # try JSON extraction
-    obj = try_extract_json_from_scripts(soup)
-    results = []
-    base_url = resp.url
-    if obj:
-        # find listing dicts inside JSON
-        listing_dicts = find_listing_dicts(obj)
-        if listing_dicts:
-            for d in listing_dicts:
-                extracted = extract_from_listing_dict(d, base_url)
-                results.append(extracted)
-            return results
-        # sometimes JSON has a 'results' field that is list
-        if isinstance(obj, dict):
-            for key in obj.keys():
-                if isinstance(obj[key], list):
-                    for it in obj[key]:
-                        if isinstance(it, dict) and contains_listing_like(it):
-                            listing_dicts += find_listing_dicts(it)
-            if listing_dicts:
-                for d in listing_dicts:
-                    extracted = extract_from_listing_dict(d, base_url)
-                    results.append(extracted)
-                return results
-    # fallback: parse cards with bs
-    cards = parse_cards_with_bs(html, base_url)
-    return cards
-
-# ------------------------
-# Orchestrator: parse multiple pages (with attempt to paginate)
-# ------------------------
-def parse_multiple_pages(base_url: str, max_pages: int = 5) -> pd.DataFrame:
+# -------------------------
+# Orchestrator: parse multiple pages and dedupe
+# -------------------------
+def parse_multiple_pages(base_url: str, pages: int) -> pd.DataFrame:
     all_rows = []
-    for i in range(1, max_pages + 1):
-        page_url = build_page_url(base_url, i)
+    for p in range(1, pages + 1):
+        page_url = build_page_url(base_url, p)
+        logger.info("Fetching page %s", page_url)
         try:
-            rows = parse_search_page(page_url)
-            if not rows:
-                logger.info("No rows found on page %s", page_url)
-            for r in rows:
-                all_rows.append(r)
+            items = parse_search_page(page_url)
+            for it in items:
+                # ignore empty or neighborhood-like entries
+                if not it.get("Valor") and not it.get("M2") and not it.get("Link"):
+                    continue
+                all_rows.append(it)
         except Exception as e:
-            logger.exception("error parsing page %s", page_url)
-        # small polite delay (configurable)
-        import time
-        time.sleep(float(st.session_state.settings.get("per_request_delay_sec", 0.5)))
+            logger.exception("Error parsing page %s", page_url)
+        time.sleep(float(st.session_state.settings.get("per_request_delay_sec", 0.6)))
     if not all_rows:
         return pd.DataFrame()
-    # dedupe by Link or Endereço+Valor
+    # dedupe by Link or (Endereco+Valor)
     seen = set()
     clean = []
     for r in all_rows:
-        key = (r.get("Link") or "") + "|" + str(r.get("Valor_raw") or "") + "|" + str(r.get("Endereço") or "")
+        key = (r.get("Link") or "") + "|" + str(r.get("Valor") or "") + "|" + str(r.get("Endereço") or "")
         if key in seen:
             continue
         seen.add(key)
         clean.append(r)
     df = pd.DataFrame(clean)
     # ensure columns order
-    cols = ["Endereço", "RuaAvenida", "Bairro", "Cidade", "Valor_raw", "Valor", "Condominio_raw", "Condominio",
+    cols = ["Endereço", "Rua", "Bairro", "Cidade", "Valor_raw", "Valor", "Condominio_raw", "Condominio",
             "IPTU_raw", "IPTU", "M2", "Quartos", "Suites", "Vaga", "Link", "bairro", "data_coleta", "ano_de_construcao"]
     for c in cols:
         if c not in df.columns:
@@ -509,22 +430,22 @@ def parse_multiple_pages(base_url: str, max_pages: int = 5) -> pd.DataFrame:
     df = df[cols]
     return df
 
-# ------------------------
+# -------------------------
 # UI
-# ------------------------
+# -------------------------
 st.title("🏘️ QuintoAndar — Extrator de resultados → Excel")
-st.markdown("Cole a URL da página de busca do QuintoAndar (ex.: bairros). O scraper tentará extrair **apenas** os resultados de busca (ignorando anúncios pagos) e gerar um Excel com as colunas solicitadas.")
+st.markdown("Cole a URL da página de busca do QuintoAndar (ex.: bairros). O scraper extrai apenas anúncios reais (ignora bairros/promos) e normaliza valores para Excel.")
 
 col1, col2 = st.columns([4, 1])
 with col1:
-    url_input = st.text_input("URL da página de busca (QuintoAndar)", value=st.session_state.scrape_url or "", placeholder="https://www.quintoandar.com.br/comprar/imovel/...")
+    url_input = st.text_input("URL da página de busca (QuintoAndar)", value=st.session_state.scrape_url or "", placeholder="https://www.quintoandar.com.br/comprar/imovel/bela-vista-sao-paulo-sp-brasil...")
 with col2:
     run_btn = st.button(f"Extrair ({st.session_state.settings['max_pages']} páginas)", use_container_width=True)
 
 with st.sidebar:
     st.header("Opções")
     st.number_input("Páginas a raspar (padrão 5)", min_value=1, max_value=50, value=int(st.session_state.settings["max_pages"]), key="max_pages_input")
-    st.slider("Delay entre requests (segundos)", 0.0, 5.0, float(st.session_state.settings.get("per_request_delay_sec", 0.5)), step=0.1, key="delay_input")
+    st.slider("Delay entre requests (segundos)", 0.0, 5.0, float(st.session_state.settings.get("per_request_delay_sec", 0.6)), step=0.1, key="delay_input")
     if st.button("Resetar estado (debug)"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
@@ -539,24 +460,23 @@ except Exception:
 
 if run_btn and url_input:
     st.session_state.scrape_url = url_input
-    max_pages = int(st.session_state.settings.get("max_pages", 5))
-    st.info(f"Iniciando extração de até {max_pages} páginas (modo: JSON-first → fallback HTML).")
+    pages = int(st.session_state.settings.get("max_pages", 5))
+    st.info(f"Iniciando extração de até {pages} páginas (JSON-first).")
     try:
-        df = parse_multiple_pages(url_input, max_pages)
+        df = parse_multiple_pages(url_input, pages)
         if df.empty:
-            st.warning("Não foram encontrados resultados de listings nas páginas fornecidas (tente abrir a página no navegador e verificar se há carregamento dinâmico via XHR).")
-            # show sample of raw head HTML for debugging
+            st.warning("Nenhum listing identificado. Verifique se a URL é realmente uma página de resultados e se a página carrega via XHR. Veja diagnóstico abaixo.")
             if st.session_state.last_raw_sample:
                 with st.expander("Amostra do HTML (diagnóstico)"):
-                    st.text(st.session_state.last_raw_sample["html_head"])
+                    st.text(st.session_state.last_raw_sample[:2000])
         else:
             st.success(f"Extraídos {len(df)} registros (após deduplicação).")
             st.session_state.scrape_df = df
-            st.dataframe(df.head(50))
-            # ask user if want to continue to next pages (if > configured)
-            if max_pages >= 5:
+            st.dataframe(df.head(80))
+            # ask to continue
+            if pages >= 5:
                 if st.button("Raspar mais páginas (próximas 5)"):
-                    st.session_state.settings["max_pages"] = max_pages + 5
+                    st.session_state.settings["max_pages"] = pages + 5
                     st.experimental_rerun()
     except Exception as e:
         logger.exception("Falha ao extrair")
@@ -584,7 +504,6 @@ with st.expander("Diagnóstico / Amostras (útil para ajustes)"):
     st.write("URL atual:", st.session_state.get("scrape_url"))
     st.write("Config:", st.session_state.settings)
     st.write("Última amostra (head):")
-    st.text(st.session_state.get("last_raw_sample", {}).get("html_head", "")[:2000])
+    st.text(st.session_state.get("last_raw_sample", "")[:2000])
 
-st.caption("Notas: O scraper tenta extrair dados visíveis na listagem (sem abrir anúncios individuais). Valores monetários e áreas são normalizados para inteiros; campos ausentes ficam como None. Se precisar de precisão total, posso ajustar seletores específicos do domínio com base no HTML completo.")
-
+st.caption("Notas: O scraper usa JSON embutido (quando disponível) no QuintoAndar para máxima precisão. Valores monetários e áreas são normalizados; campos ausentes ficam como None. Se precisar que eu abra cada anúncio para preencher IPTU/Condomínio/ano de construção, posso adicionar essa opção (será mais lento).")

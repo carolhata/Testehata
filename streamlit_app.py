@@ -1,3 +1,4 @@
+# streamlit_app.py
 import os
 import re
 import json
@@ -39,9 +40,20 @@ if not OPENAI_API_KEY:
     st.error("Defina OPENAI_API_KEY em Secrets antes de usar.")
     st.stop()
 
+# =========================
+# Inicialização segura do cliente OpenAI (modo legacy)
+# =========================
+# Usamos o módulo legacy `openai` para evitar problemas de dependências (httpx) no ambiente.
+import openai as _openai_module  # module-style client
+
+# Garantir que alguns SDKs/leitores de ambiente encontrem a chave
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-from openai import OpenAI
-client = OpenAI()
+_openai_module.api_key = OPENAI_API_KEY
+
+# apontamos 'client' para o módulo legacy para compatibilidade com ChatCompletion streaming
+client = _openai_module
+_openai_client_mode = "legacy-module"
+logger.info(f"OpenAI client mode: {_openai_client_mode}")
 
 # =========================
 # Modelos e validação
@@ -224,21 +236,45 @@ st.caption("Raspagem direta com fallback para Tavily Extract e Jina Reader. Expo
 # Utilidades de IA e Web
 # =========================
 def openai_stream_chat(messages: List[dict], model: str, temperature: float, max_tokens: int, system_prompt: str):
+    """
+    Streaming usando o módulo legacy `openai` (client = openai).
+    Espera-se que client.ChatCompletion.create(..., stream=True) retorne um gerador de chunks dict-like.
+    """
     full_messages = [{"role": "system", "content": system_prompt}] + messages
-    stream = client.chat.completions.create(
-        model=model,
-        messages=full_messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stream=True
-    )
+
+    try:
+        stream = client.ChatCompletion.create(
+            model=model,
+            messages=full_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True
+        )
+    except Exception as e:
+        logger.exception("Erro ao iniciar stream OpenAI (legacy)")
+        raise
+
     partial = ""
     placeholder = st.empty()
-    for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta and getattr(delta, "content", None):
-            partial += delta.content
-            placeholder.markdown(partial)
+    try:
+        for chunk in stream:
+            try:
+                # chunk é dict-like: {'choices': [{'delta': {'content': '...'}}], ...}
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}) or {}
+                content_piece = delta.get("content") or delta.get("text") or None
+            except Exception:
+                content_piece = None
+
+            if content_piece:
+                partial += content_piece
+                placeholder.markdown(partial)
+    except Exception as e:
+        logger.exception("Erro durante streaming (legacy)")
+        raise
+
     return partial
 
 def tavily_search(query: str, depth: str = "basic", max_results: int = 5) -> Dict[str, Any]:
@@ -509,7 +545,8 @@ with st.expander("Diagnóstico técnico"):
             "inject_scrape": s["inject_scrape"],
             "scrape_char_limit": s["scrape_char_limit"],
             "tem_scrape_context": bool(st.session_state.scrape_context),
-            "streamlit_cloud_ready": True
+            "streamlit_cloud_ready": True,
+            "openai_client_mode": _openai_client_mode
         }
     )
 

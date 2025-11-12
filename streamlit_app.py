@@ -1,429 +1,570 @@
 # streamlit_app.py
-# Template ajustado para raspagem de resultados de busca (listings) e exportação Excel
-import os
+# Scraper adaptado para QuintoAndar (melhor esforço): extrai resultados de busca (listings) e gera Excel
 import re
 import json
 import logging
 from io import BytesIO
-from urllib.parse import urlparse, urljoin
-from typing import List, Literal, Optional, Dict, Any
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
+from urllib.parse import urlparse, urljoin, urlencode, parse_qs, urlsplit, urlunsplit
 
 import streamlit as st
 
-# MUST be the first Streamlit command in this module
-st.set_page_config(
-    page_title="Raspador de Listings → Excel",
-    page_icon="🧾",
-    layout="centered"
-)
+# MUST be the first Streamlit command
+st.set_page_config(page_title="QuintoAndar → Listings → Excel", page_icon="🏘️", layout="centered")
 
-# safe to import rest
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from pydantic import BaseModel, Field, PositiveInt, validator
+import pandas as pd
+from pydantic import BaseModel, Field, PositiveInt
 
-# logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("listings-scraper")
+logger = logging.getLogger("qa-listings-scraper")
 
-# =========================
-# Secrets (after set_page_config)
-# =========================
-def get_secret(name: str) -> Optional[str]:
-    try:
-        return st.secrets.get(name, None)
-    except Exception:
-        return None
-
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
-# Tavily optional (leave as is)
-TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
-
-# We won't require OPENAI here; keep optional
-# =========================
-# App settings data model
-# =========================
+# ------------------------
+# Settings & session_state
+# ------------------------
 class AppSettings(BaseModel):
-    # kept minimal for compatibility with previous app
-    scrape_char_limit: PositiveInt = Field(default=8000)
+    max_pages: PositiveInt = Field(default=5)
+    per_request_delay_sec: float = Field(default=0.5)
 
-# =========================
-# session_state initialization & normalization
-# =========================
-if "history" not in st.session_state:
-    st.session_state.history = []
 if "settings" not in st.session_state:
     st.session_state.settings = AppSettings().dict()
-# normalize settings to ensure keys
-try:
-    if not isinstance(st.session_state.settings, dict):
-        st.session_state.settings = AppSettings().dict()
-    else:
+else:
+    # normalize
+    try:
         defaults = AppSettings().dict()
         for k, v in defaults.items():
             if k not in st.session_state.settings:
                 st.session_state.settings[k] = v
-except Exception:
-    st.session_state.settings = AppSettings().dict()
+    except Exception:
+        st.session_state.settings = AppSettings().dict()
 
+if "scrape_df" not in st.session_state:
+    st.session_state.scrape_df = None
 if "scrape_url" not in st.session_state:
     st.session_state.scrape_url = ""
-if "scrape_df" not in st.session_state:
-    st.session_state.scrape_df = None  # will hold DataFrame of listings
+if "last_raw_sample" not in st.session_state:
+    st.session_state.last_raw_sample = None  # for diagnostics
 
-# =========================
-# Utilities: parsing helpers
-# =========================
-def first_text_or_none(el):
-    try:
-        t = el.get_text(separator=" ", strip=True)
-        return t if t else None
-    except Exception:
+# ------------------------
+# Helpers: normalization
+# ------------------------
+money_rx = re.compile(r"[\d\.\s]*\d+[,\.]?\d*", re.UNICODE)
+m2_rx = re.compile(r"(\d{1,4})\s*(?:m²|m2|m\^2)", re.IGNORECASE)
+rooms_rx = re.compile(r"(\d+)\s*(quartos|qtos|dormit[oó]rios|dormit[oó]rio)", re.IGNORECASE)
+suite_rx = re.compile(r"(\d+)\s*(su[ií]tes?|su[ií]te)", re.IGNORECASE)
+vaga_rx = re.compile(r"(\d+)\s*(vagas?|vaga)", re.IGNORECASE)
+
+def parse_money_to_int(s: Optional[str]) -> Optional[int]:
+    if not s:
         return None
+    # remove R$, spaces, thousands separators; treat comma as decimal separator
+    s = str(s)
+    s = s.replace("R$", "").replace("r$", "").strip()
+    # keep numbers, dots and commas
+    s = re.sub(r"[^\d\,\.]", "", s)
+    if not s:
+        return None
+    # if contains comma and dot, remove thousands separators
+    if "," in s and "." in s:
+        # assume format 1.234.567,89 -> remove dots, replace comma with dot
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        # remove dots as thousands separator
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
+    try:
+        val = float(s)
+        return int(round(val))
+    except Exception:
+        # fallback: extract digits
+        digits = re.sub(r"[^\d]", "", s)
+        return int(digits) if digits else None
 
-money_rx = re.compile(r"(R\$[\s\d\.\,kKmM]+|\d[\d\.\,]*\s*R\$)", re.IGNORECASE)
-m2_rx = re.compile(r"(\d{1,4}\s*(m²|m2|m²|m\^2))", re.IGNORECASE)
-rooms_rx = re.compile(r"(\d+)\s*(quartos|qd|qtos|dormitórios|dormitório)", re.IGNORECASE)
-suite_rx = re.compile(r"(\d+)\s*(suítes|suíte|suite)", re.IGNORECASE)
-vaga_rx = re.compile(r"(\d+)\s*(vagas|vaga)", re.IGNORECASE)
-iptu_rx = re.compile(r"(IPTU[:\s]*R?\$?\s*[\d\.\,kKmM]+)", re.IGNORECASE)
-cond_rx = re.compile(r"(Condomínio|Condominio|condomínio|condominio)[:\s]*R?\$?\s*[\d\.\,kKmM]+", re.IGNORECASE)
+def parse_m2_to_int(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    if isinstance(s, (int, float)):
+        return int(s)
+    m = m2_rx.search(str(s))
+    if m:
+        try:
+            return int(m.group(1))
+        except:
+            return None
+    # fallback: digits
+    d = re.findall(r"\d{1,4}", s)
+    return int(d[0]) if d else None
 
-def is_probably_ad(tag: BeautifulSoup) -> bool:
+def parse_int_from_text(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    d = re.search(r"(\d+)", str(s))
+    return int(d.group(1)) if d else None
+
+def now_isoutc():
+    return datetime.now(timezone.utc).isoformat()
+
+# ------------------------
+# Helpers: URL / pagination
+# ------------------------
+def build_page_url(base_url: str, page_index: int) -> str:
     """
-    Heurística para detectar anúncios/patrocinados: palavras em class/id/text
+    Attempt to create a paginated URL. QuintoAndar often uses query params for pagination.
+    Strategy:
+      - If URL already has 'page' or 'pagina' param, replace it.
+      - Else append '?page=2' (or '&page=2' if ? already exists).
     """
-    text = (tag.get_text(" ", strip=True) or "").lower()
-    class_id = " ".join(filter(None, [(" ".join(tag.get("class") or [])).lower() if tag.get("class") else "", (tag.get("id") or "").lower()]))
-    # common ad markers
-    ad_markers = ["ad", "ads", "patrocinad", "patrocinio", "promoted", "anúncio", "anuncio", "sponsored"]
-    for m in ad_markers:
-        if m in text or m in class_id:
+    try:
+        parts = list(urlsplit(base_url))
+        qs = parse_qs(parts[3])
+        if "page" in qs or "pagina" in qs:
+            qs["page"] = [str(page_index)]
+            parts[3] = urlencode(qs, doseq=True)
+            return urlunsplit(parts)
+        # some sites use ?pagina=2 or ?pagina=1; add page param
+        if "?" in base_url:
+            return base_url + "&page=" + str(page_index)
+        else:
+            return base_url + "?page=" + str(page_index)
+    except Exception:
+        return base_url
+
+# ------------------------
+# JSON extraction helper (for SPA pages)
+# ------------------------
+def try_extract_json_from_scripts(soup: BeautifulSoup) -> Optional[Any]:
+    """
+    Busca por JSON embutido nos <script> da página (heurístico).
+    Retorna o primeiro objeto JSON contendo chaves relacionadas a listings.
+    """
+    scripts = soup.find_all("script")
+    candidate_keys = ["listings", "properties", "searchResults", "houses", "items", "results"]
+    for s in scripts:
+        text = s.string or s.get_text(" ", strip=True) or ""
+        # heurística: procurar '=' seguido de '{' ou '[' e terminar com ';' ou </script>
+        # extração por regex: capture {...} or [...]
+        # tentamos várias tentativas para não quebrar em JSON inválido
+        # 1) find first '{' or '[' and try to json.loads progressive slices
+        idx = None
+        if "=" in text:
+            # split on '=' and check right side
+            parts = text.split("=", 1)
+            right = parts[1].strip()
+            # try to find first { or [
+            m = re.search(r"([\{\[])", right)
+            if m:
+                start = m.start()
+                # do progressive extraction until a valid JSON is found
+                for end in range(len(right)-1, start+1, -1):
+                    snippet = right[start:end+1].strip().rstrip(";,")
+                    try:
+                        obj = json.loads(snippet)
+                        # check if object contains candidate keys
+                        if isinstance(obj, dict):
+                            keys = " ".join(list(obj.keys())).lower()
+                            if any(k.lower() in keys for k in candidate_keys):
+                                return obj
+                            # also search nested
+                            if contains_listing_like(obj):
+                                return obj
+                        elif isinstance(obj, list):
+                            # list of objects
+                            for item in obj:
+                                if isinstance(item, dict) and contains_listing_like(item):
+                                    return obj
+                    except Exception:
+                        continue
+        # 2) fallback: try to find JSON-looking substring with searchResults word
+        if "searchResults" in text or "listings" in text or "properties" in text:
+            # try to extract JSON by finding first { and last }
+            try:
+                first = text.index("{")
+                last = text.rindex("}")
+                snippet = text[first:last+1]
+                obj = json.loads(snippet)
+                if contains_listing_like(obj):
+                    return obj
+            except Exception:
+                continue
+    return None
+
+def contains_listing_like(obj: Any) -> bool:
+    """
+    Heurística simples: check if object or nested contains price/valor/link keys.
+    """
+    if isinstance(obj, dict):
+        keys = " ".join(obj.keys()).lower()
+        if any(k in keys for k in ["price", "valor", "priceLabel", "listing", "property", "link", "slug", "id"]):
             return True
+        for v in obj.values():
+            if contains_listing_like(v):
+                return True
+    elif isinstance(obj, list):
+        for it in obj:
+            if contains_listing_like(it):
+                return True
     return False
 
-def find_listing_cards(soup: BeautifulSoup) -> List[BeautifulSoup]:
-    """
-    Tenta localizar os 'cards' de resultados de busca com heurísticas:
-    - elementos com classes contendo 'list', 'card', 'result', 'item', 'property', 'listing'
-    - evita containers que pareçam anúncios
-    """
-    candidates = []
-    selectors = [
-        "[class*='listing']",
-        "[class*='card']",
-        "[class*='result']",
-        "[class*='item']",
-        "[class*='property']",
-        "[class*='ad']",
-        "[class*='anuncio']",
-        "li",
-        "article",
-        "div"
-    ]
-    # Search for candidate blocks
-    for sel in selectors:
-        for el in soup.select(sel):
-            # ignore tiny elements
-            text = (el.get_text(" ", strip=True) or "")
-            if len(text) < 30:
-                continue
-            # skip obvious ads
-            if is_probably_ad(el):
-                continue
-            # ensure it's not a top-level container that contains many results (we want individual cards)
-            # heuristics: card should not have many child elements that themselves contain 200+ chars (avoid containers)
-            child_texts = [c.get_text(" ", strip=True) for c in el.find_all(recursive=False)]
-            if any(len(ct or "") > 400 for ct in child_texts):
-                # could be big container; still consider but lower priority
+# ------------------------
+# Recursive finder for listing dicts
+# ------------------------
+def find_listing_dicts(obj: Any) -> List[Dict[str, Any]]:
+    found = []
+    if isinstance(obj, dict):
+        # candidate: has price or valor and has some url/id
+        lowkeys = {k.lower(): v for k, v in obj.items()}
+        if any(k in lowkeys for k in ["price", "valor", "priceLabel"]) and any(k in lowkeys for k in ["url", "link", "slug", "id", "path"]):
+            found.append(obj)
+        # also if has 'results' or 'listings' keys inspect them
+        for k, v in obj.items():
+            found += find_listing_dicts(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            found += find_listing_dicts(item)
+    return found
+
+# ------------------------
+# Extract from JSON listing dict (best-effort mapping)
+# ------------------------
+def extract_from_listing_dict(d: Dict[str, Any], base_url: str) -> Dict[str, Optional[Any]]:
+    # flatten keys to search
+    js = json.dumps(d)
+    # link detection
+    link = None
+    for candidate in ("url", "link", "slug", "path", "permalink"):
+        if candidate in d and d[candidate]:
+            link = d[candidate]
+            break
+    # sometimes nested
+    if not link:
+        for k, v in d.items():
+            if isinstance(v, str) and v.startswith("/imovel"):
+                link = v
+                break
+    if link:
+        link = urljoin(base_url, link)
+    # address
+    address = None
+    for candidate in ("address", "endereco", "location", "displayAddress", "formattedAddress"):
+        if candidate in d and d[candidate]:
+            address = d[candidate]
+            break
+    # price
+    valor = None
+    for candidate in ("price", "valor", "listedPrice", "displayPrice"):
+        if candidate in d and d[candidate]:
+            valor = d[candidate]
+            break
+    # condominium
+    cond = None
+    for candidate in ("condominium", "condominio", "condominiumFee", "condo"):
+        if candidate in d and d[candidate]:
+            cond = d[candidate]
+            break
+    # iptu
+    iptu = None
+    for candidate in ("iptu", "propertyTax", "iptuValue"):
+        if candidate in d and d[candidate]:
+            iptu = d[candidate]
+            break
+    # m2
+    m2 = None
+    for candidate in ("area", "usableArea", "m2", "size"):
+        if candidate in d and d[candidate]:
+            m2 = d[candidate]
+            break
+    # rooms
+    quartos = None
+    for candidate in ("bedrooms", "rooms", "quartos", "bedroomCount"):
+        if candidate in d and d[candidate] is not None:
+            quartos = d[candidate]
+            break
+    # suites
+    suites = None
+    for candidate in ("suites", "suiteCount", "bathrooms"):
+        if candidate in d and d[candidate] is not None:
+            suites = d[candidate]
+            break
+    # vagas
+    vagas = None
+    for candidate in ("parkingSpaces", "garage", "vagas", "parking"):
+        if candidate in d and d[candidate] is not None:
+            vagas = d[candidate]
+            break
+    # bairro / cidade attempts
+    bairro = None
+    cidade = None
+    if "city" in d:
+        cidade = d.get("city")
+    if "neighborhood" in d:
+        bairro = d.get("neighborhood")
+    if isinstance(address, str):
+        # try to split "Rua X - Bairro - Cidade"
+        parts = [p.strip() for p in re.split(r"[,\-–—]", address) if p.strip()]
+        if parts:
+            # attempt heuristics
+            if len(parts) >= 3:
+                rua = parts[0]
+                bairro = bairro or parts[1]
+                cidade = cidade or parts[-1]
+            elif len(parts) == 2:
+                rua = parts[0]
+                bairro = bairro or parts[1]
+            else:
+                rua = parts[0]
+        else:
+            rua = address
+    else:
+        rua = None
+
+    # ano de construcao (try common keys)
+    ano = None
+    for candidate in ("yearBuilt", "constructionYear", "builtYear", "anoConstrucao", "ano"):
+        if candidate in d and d[candidate]:
+            try:
+                ano = int(d[candidate])
+                break
+            except:
                 pass
-            candidates.append(el)
-    # Deduplicate by id or text snippet
+
+    return {
+        "Endereço": address,
+        "RuaAvenida": rua,
+        "Bairro": bairro,
+        "Cidade": cidade,
+        "Valor_raw": str(valor) if valor is not None else None,
+        "Valor": parse_money_to_int(valor),
+        "Condominio_raw": str(cond) if cond is not None else None,
+        "Condominio": parse_money_to_int(cond),
+        "IPTU_raw": str(iptu) if iptu is not None else None,
+        "IPTU": parse_money_to_int(iptu),
+        "M2": parse_m2_to_int(m2),
+        "Quartos": parse_int_from_text(quartos),
+        "Suites": parse_int_from_text(suites),
+        "Vaga": parse_int_from_text(vagas),
+        "Link": link,
+        "bairro": bairro,
+        "data_coleta": now_isoutc(),
+        "ano_de_construcao": ano
+    }
+
+# ------------------------
+# HTML fallback card parser (if JSON not found)
+# ------------------------
+def parse_cards_with_bs(html: str, base_url: str) -> List[Dict[str, Any]]:
+    soup = BeautifulSoup(html, "lxml")
+    cards = []
+    # find probable item containers
+    candidates = soup.select("[class*='listing'], [class*='card'], [class*='result'], [class*='property'], li, article")
     seen = set()
-    filtered = []
     for c in candidates:
-        key = (c.get("id") or "") + "|" + (c.get("class")[0] if c.get("class") else "") + "|" + (c.get_text(" ", strip=True)[:200])
+        text = c.get_text(" ", strip=True)
+        if len(text) < 40:
+            continue
+        key = text[:200]
         if key in seen:
             continue
         seen.add(key)
-        filtered.append(c)
-    # Heuristic: many generic divs matched; keep those that have price or square meters or 'quartos'
-    final = []
-    for c in filtered:
-        t = c.get_text(" ", strip=True)
-        if money_rx.search(t) or m2_rx.search(t) or rooms_rx.search(t) or "vaga" in t.lower():
-            final.append(c)
-    # If none found by heuristics, fallback to a small set of filtered items (avoid huge containers)
-    if not final:
-        # find direct children likely to be list items under a results container
-        for container in soup.select("[class*='results'], [id*='results'], [class*='list'], [id*='list']"):
-            for li in container.find_all(["li", "article", "div"], recursive=False):
-                if is_probably_ad(li):
-                    continue
-                t = li.get_text(" ", strip=True)
-                if len(t) > 50 and (money_rx.search(t) or m2_rx.search(t) or rooms_rx.search(t)):
-                    final.append(li)
-        # as last resort, try top-level li/article
-        if not final:
-            for li in soup.find_all(["li", "article"], limit=80):
-                if is_probably_ad(li):
-                    continue
-                t = li.get_text(" ", strip=True)
-                if len(t) > 50 and (money_rx.search(t) or m2_rx.search(t) or rooms_rx.search(t)):
-                    final.append(li)
-    return final
-
-def extract_field_from_card(card, base_url) -> Dict[str, Optional[str]]:
-    """
-    Extrai heurísticamente os campos requeridos de um elemento 'card'
-    """
-    text = card.get_text(" ", strip=True) or ""
-    # link: prefer the largest anchor in the card
-    link = None
-    a_tags = card.find_all("a", href=True)
-    if a_tags:
-        # choose href of the anchor with longest text or first anchor with 'href' that looks internal/external listing
-        a_tags_sorted = sorted(a_tags, key=lambda a: len(a.get_text(" ", strip=True) or ""), reverse=True)
-        href = a_tags_sorted[0].get("href")
-        # make absolute
-        if href:
-            link = urljoin(base_url, href)
-    # endereço: try common address tags or patterns
-    address = None
-    # try find elements with aria-label or address tag
-    addr_el = card.find(["address"]) or card.find(attrs={"aria-label": re.compile(r"endereço|address|localização|localizacao", re.I)})
-    if addr_el:
-        address = first_text_or_none(addr_el)
-    if not address:
-        # heuristic: look for text with street markers (Rua, Av., Avenida, Travessa, R., Alameda)
-        m = re.search(r"((R\.|Rua|Av\.|Avenida|Travessa|Alameda|Estrada|Rodovia)\s+[^\n,]{3,80})", text, re.I)
+        # ignore obvious ads
+        if re.search(r"patrocinad|anúncio|promovido|sponsored|publicidade", text, re.I):
+            continue
+        # try extract link
+        a = c.find("a", href=True)
+        link = None
+        if a:
+            link = urljoin(base_url, a.get("href"))
+        # value
+        money_search = re.search(r"R\$\s?[\d\.\,kKmM]+", text)
+        valor = money_search.group(0) if money_search else None
+        # m2
+        m2 = None
+        m = m2_rx.search(text)
         if m:
-            address = m.group(1).strip()
-    # valor
-    valor = None
-    m = money_rx.search(text)
-    if m:
-        valor = m.group(0).strip()
-    # condominio
-    cond = None
-    m = cond_rx.search(text)
-    if m:
-        cond = m.group(0).split(":", 1)[-1].strip() if ":" in m.group(0) else m.group(0).strip()
-    else:
-        # try pattern "Condomínio R$ 1.000"
-        m2 = re.search(r"(Condom[ií]o[:\s]*R?\$?\s*[\d\.\,kKmM]+)", text, re.I)
-        if m2:
-            cond = m2.group(1).split(":", 1)[-1].strip()
-    # IPTU
-    iptu = None
-    m = iptu_rx.search(text)
-    if m:
-        iptu = m.group(0).split(":", 1)[-1].strip() if ":" in m.group(0) else m.group(0).strip()
-    # M2
-    m2 = None
-    m = m2_rx.search(text)
-    if m:
-        m2 = m.group(1).replace(" ", "")
-    # Quartos
-    quartos = None
-    m = rooms_rx.search(text)
-    if m:
-        quartos = m.group(1)
-    # Suites
-    suites = None
-    m = suite_rx.search(text)
-    if m:
-        suites = m.group(1)
-    # Vaga(s)
-    vagas = None
-    m = vaga_rx.search(text)
-    if m:
-        vagas = m.group(1)
-    # fallback: try dedicated spans/labels
-    # try to find element labelled "Quartos" etc.
-    def find_label_value(card, label_patterns: List[str]) -> Optional[str]:
-        for pat in label_patterns:
-            el = card.find(string=re.compile(pat, re.I))
-            if el:
-                # try next sibling or parent text
-                parent = el.parent
-                # sibling
-                sib_text = None
-                if parent:
-                    # try parent next sibling
-                    next_el = parent.find_next_sibling()
-                    if next_el:
-                        sib_text = first_text_or_none(next_el)
-                if not sib_text:
-                    # try parent text minus label
-                    pt = first_text_or_none(parent)
-                    if pt:
-                        # remove label word
-                        candidate = re.sub(pat, "", pt, flags=re.I).strip()
-                        if candidate:
-                            sib_text = candidate
-                if sib_text:
-                    return sib_text
-        return None
+            m2 = m.group(1)
+        # quartos suites vagas
+        quartos = None
+        m = rooms_rx.search(text)
+        if m:
+            quartos = m.group(1)
+        suites = None
+        m = suite_rx.search(text)
+        if m:
+            suites = m.group(1)
+        vagas = None
+        m = vaga_rx.search(text)
+        if m:
+            vagas = m.group(1)
+        # condominio / iptu
+        cond = None
+        m = re.search(r"Condom[ií]nio[:\s]*R?\$?[\s\d\.\,kKmM]+", text, re.I)
+        if m:
+            cond = re.sub(r"Condom[ií]nio[:\s]*", "", m.group(0), flags=re.I).strip()
+        iptu = None
+        m = re.search(r"IPTU[:\s]*R?\$?[\s\d\.\,kKmM]+", text, re.I)
+        if m:
+            iptu = re.sub(r"IPTU[:\s]*", "", m.group(0), flags=re.I).strip()
+        # address heuristic
+        address = None
+        m = re.search(r"(Rua|Av\.|Avenida|Travessa|Alameda|R\.)\s+[^\n,]{5,80}", text)
+        if m:
+            address = m.group(0).strip()
+        cards.append({
+            "Endereço": address,
+            "RuaAvenida": address,
+            "Bairro": None,
+            "Cidade": None,
+            "Valor_raw": valor,
+            "Valor": parse_money_to_int(valor),
+            "Condominio_raw": cond,
+            "Condominio": parse_money_to_int(cond),
+            "IPTU_raw": iptu,
+            "IPTU": parse_money_to_int(iptu),
+            "M2": parse_m2_to_int(m2),
+            "Quartos": parse_int_from_text(quartos),
+            "Suites": parse_int_from_text(suites),
+            "Vaga": parse_int_from_text(vagas),
+            "Link": link,
+            "bairro": None,
+            "data_coleta": now_isoutc(),
+            "ano_de_construcao": None
+        })
+    return cards
 
-    if not quartos:
-        q = find_label_value(card, ["quartos?", "dormit[oó]rios?", "qtos?", r"(\d)\s*quarto"])
-        if q:
-            # extract number
-            mq = re.search(r"(\d+)", q)
-            if mq:
-                quartos = mq.group(1)
-
-    if not suites:
-        s = find_label_value(card, ["su[ií]tes?", "su[ií]te", "suite"])
-        if s:
-            ms = re.search(r"(\d+)", s)
-            if ms:
-                suites = ms.group(1)
-
-    if not vagas:
-        v = find_label_value(card, ["vagas?", "vaga"])
-        if v:
-            mv = re.search(r"(\d+)", v)
-            if mv:
-                vagas = mv.group(1)
-
-    # final dictionary (normalize empty strings to None)
-    return {
-        "Endereço": address or None,
-        "Valor": valor or None,
-        "Condominio": cond or None,
-        "IPTU": iptu or None,
-        "M2": m2 or None,
-        "Quartos": quartos or None,
-        "Suites": suites or None,
-        "Vaga": vagas or None,
-        "Link": link or None
-    }
-
-def parse_listings_from_url(url: str, limit: int = 100) -> pd.DataFrame:
-    """
-    Faz download da página e tenta extrair os listings da página de resultados de busca.
-    Retorna DataFrame com as colunas solicitadas.
-    """
-    logger.info("Fetching URL for listings parse: %s", url)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; ListingsScraper/1.0)",
-        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-    except Exception as e:
-        logger.exception("HTTP error fetching url")
-        raise RuntimeError(f"Falha ao baixar a URL: {e}")
-
-    content_type = resp.headers.get("Content-Type", "")
-    if "html" not in content_type.lower():
-        raise RuntimeError(f"Conteúdo não-HTML: {content_type}")
-
+# ------------------------
+# Main parse function per page (tries JSON then HTML)
+# ------------------------
+def parse_search_page(url: str) -> List[Dict[str, Any]]:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; QuintoAndarScraper/1.0)", "Accept-Language": "pt-BR,pt;q=0.9"}
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
     html = resp.text
     soup = BeautifulSoup(html, "lxml")
+    st.session_state.last_raw_sample = {"url": url, "html_head": html[:5000]}
+    # try JSON extraction
+    obj = try_extract_json_from_scripts(soup)
+    results = []
+    base_url = resp.url
+    if obj:
+        # find listing dicts inside JSON
+        listing_dicts = find_listing_dicts(obj)
+        if listing_dicts:
+            for d in listing_dicts:
+                extracted = extract_from_listing_dict(d, base_url)
+                results.append(extracted)
+            return results
+        # sometimes JSON has a 'results' field that is list
+        if isinstance(obj, dict):
+            for key in obj.keys():
+                if isinstance(obj[key], list):
+                    for it in obj[key]:
+                        if isinstance(it, dict) and contains_listing_like(it):
+                            listing_dicts += find_listing_dicts(it)
+            if listing_dicts:
+                for d in listing_dicts:
+                    extracted = extract_from_listing_dict(d, base_url)
+                    results.append(extracted)
+                return results
+    # fallback: parse cards with bs
+    cards = parse_cards_with_bs(html, base_url)
+    return cards
 
-    cards = find_listing_cards(soup)
-    logger.info("Found %d candidate cards", len(cards))
-    rows = []
-    base_url = resp.url  # after redirects
-
-    count = 0
-    for card in cards:
-        if count >= limit:
-            break
-        # double-check not ad
-        if is_probably_ad(card):
-            continue
-        data = extract_field_from_card(card, base_url)
-        # require at least Valor or M2 or Link to consider valid listing
-        if any([data.get("Valor"), data.get("M2"), data.get("Link")]):
-            rows.append(data)
-            count += 1
-
-    # deduplicate by Link or (Valor+Endereço)
+# ------------------------
+# Orchestrator: parse multiple pages (with attempt to paginate)
+# ------------------------
+def parse_multiple_pages(base_url: str, max_pages: int = 5) -> pd.DataFrame:
+    all_rows = []
+    for i in range(1, max_pages + 1):
+        page_url = build_page_url(base_url, i)
+        try:
+            rows = parse_search_page(page_url)
+            if not rows:
+                logger.info("No rows found on page %s", page_url)
+            for r in rows:
+                all_rows.append(r)
+        except Exception as e:
+            logger.exception("error parsing page %s", page_url)
+        # small polite delay (configurable)
+        import time
+        time.sleep(float(st.session_state.settings.get("per_request_delay_sec", 0.5)))
+    if not all_rows:
+        return pd.DataFrame()
+    # dedupe by Link or Endereço+Valor
     seen = set()
-    deduped = []
-    for r in rows:
-        key = (r.get("Link") or "") + "|" + (r.get("Valor") or "") + "|" + (r.get("Endereço") or "")
+    clean = []
+    for r in all_rows:
+        key = (r.get("Link") or "") + "|" + str(r.get("Valor_raw") or "") + "|" + str(r.get("Endereço") or "")
         if key in seen:
             continue
         seen.add(key)
-        deduped.append(r)
-
-    df = pd.DataFrame(deduped)
-    # normalize columns order
-    expected_cols = ["Endereço", "Valor", "Condominio", "IPTU", "M2", "Quartos", "Suites", "Vaga", "Link"]
-    for c in expected_cols:
+        clean.append(r)
+    df = pd.DataFrame(clean)
+    # ensure columns order
+    cols = ["Endereço", "RuaAvenida", "Bairro", "Cidade", "Valor_raw", "Valor", "Condominio_raw", "Condominio",
+            "IPTU_raw", "IPTU", "M2", "Quartos", "Suites", "Vaga", "Link", "bairro", "data_coleta", "ano_de_construcao"]
+    for c in cols:
         if c not in df.columns:
             df[c] = None
-    df = df[expected_cols]
+    df = df[cols]
     return df
 
-# =========================
-# UI: Sidebar controls
-# =========================
+# ------------------------
+# UI
+# ------------------------
+st.title("🏘️ QuintoAndar — Extrator de resultados → Excel")
+st.markdown("Cole a URL da página de busca do QuintoAndar (ex.: bairros). O scraper tentará extrair **apenas** os resultados de busca (ignorando anúncios pagos) e gerar um Excel com as colunas solicitadas.")
+
+col1, col2 = st.columns([4, 1])
+with col1:
+    url_input = st.text_input("URL da página de busca (QuintoAndar)", value=st.session_state.scrape_url or "", placeholder="https://www.quintoandar.com.br/comprar/imovel/...")
+with col2:
+    run_btn = st.button(f"Extrair ({st.session_state.settings['max_pages']} páginas)", use_container_width=True)
+
 with st.sidebar:
-    st.header("Configuração")
-    scrape_mode = st.radio("Tipo de extração", ["Texto completo (fallback)", "Resultados de busca (listings)"], index=1)
-    max_listings = st.number_input("Máx de listings a extrair", min_value=5, max_value=500, value=80, step=5)
-    st.markdown("---")
-    # reset button for debug
+    st.header("Opções")
+    st.number_input("Páginas a raspar (padrão 5)", min_value=1, max_value=50, value=int(st.session_state.settings["max_pages"]), key="max_pages_input")
+    st.slider("Delay entre requests (segundos)", 0.0, 5.0, float(st.session_state.settings.get("per_request_delay_sec", 0.5)), step=0.1, key="delay_input")
     if st.button("Resetar estado (debug)"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.experimental_rerun()
 
-# =========================
-# Main UI
-# =========================
-st.title("🧾 Raspador de resultados de busca → Excel")
-st.markdown("Cole a URL da página de resultados de busca (ex.: página com múltiplos anúncios/listings). O scrapper tentará **extrair apenas os resultados de busca** (ignorando anúncios/patrocinados).")
-
-col1, col2 = st.columns([4, 1])
-with col1:
-    url_input = st.text_input("URL da página de busca", value=st.session_state.scrape_url or "", placeholder="https://exemplo.com/busca?q=apartamento")
-with col2:
-    run_btn = st.button("Extrair", use_container_width=True)
+# sync sidebar inputs
+try:
+    st.session_state.settings["max_pages"] = int(st.session_state.get("max_pages_input", st.session_state.settings["max_pages"]))
+    st.session_state.settings["per_request_delay_sec"] = float(st.session_state.get("delay_input", st.session_state.settings["per_request_delay_sec"]))
+except Exception:
+    pass
 
 if run_btn and url_input:
     st.session_state.scrape_url = url_input
-    with st.spinner("Raspando página e extraindo resultados..."):
-        try:
-            if scrape_mode == "Resultados de busca (listings)":
-                df = parse_listings_from_url(url_input, limit=int(max_listings))
-                if df is None or df.empty:
-                    st.warning("Nenhum listing identificado automaticamente. Tente alternar para 'Texto completo' ou passe a URL exata da listagem.")
-                else:
-                    st.success(f"Extraídos {len(df)} resultados (após heurística).")
-                    st.session_state.scrape_df = df
-                    # show preview
-                    st.dataframe(df.head(50))
-            else:
-                # fallback to previous behavior: scrape full text (lighter)
-                from bs4 import BeautifulSoup as BS
-                resp = requests.get(url_input, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-                soup = BS(resp.text, "lxml")
-                for tag in soup(["script", "style", "noscript", "template"]):
-                    tag.decompose()
-                text = re.sub(r"\n\s*\n+", "\n\n", soup.get_text(separator="\n"))
-                st.session_state.scrape_df = None
-                st.success("Texto da página extraído (use download abaixo para salvar).")
-                with st.expander("Prévia do texto raspado"):
-                    st.write(text[:10000])
-        except Exception as e:
-            logger.exception("Erro na extração")
-            st.error(f"Falha ao extrair: {e}")
+    max_pages = int(st.session_state.settings.get("max_pages", 5))
+    st.info(f"Iniciando extração de até {max_pages} páginas (modo: JSON-first → fallback HTML).")
+    try:
+        df = parse_multiple_pages(url_input, max_pages)
+        if df.empty:
+            st.warning("Não foram encontrados resultados de listings nas páginas fornecidas (tente abrir a página no navegador e verificar se há carregamento dinâmico via XHR).")
+            # show sample of raw head HTML for debugging
+            if st.session_state.last_raw_sample:
+                with st.expander("Amostra do HTML (diagnóstico)"):
+                    st.text(st.session_state.last_raw_sample["html_head"])
+        else:
+            st.success(f"Extraídos {len(df)} registros (após deduplicação).")
+            st.session_state.scrape_df = df
+            st.dataframe(df.head(50))
+            # ask user if want to continue to next pages (if > configured)
+            if max_pages >= 5:
+                if st.button("Raspar mais páginas (próximas 5)"):
+                    st.session_state.settings["max_pages"] = max_pages + 5
+                    st.experimental_rerun()
+    except Exception as e:
+        logger.exception("Falha ao extrair")
+        st.error(f"Falha ao extrair: {e}")
 
-# download/export area
 st.markdown("---")
-st.subheader("Exportar para Excel")
-
-def df_to_excel_bytes_for_listings(df: pd.DataFrame, sheet_name: str = "listings") -> bytes:
+st.subheader("Exportar Excel")
+def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "listings"):
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
@@ -432,30 +573,18 @@ def df_to_excel_bytes_for_listings(df: pd.DataFrame, sheet_name: str = "listings
 
 if st.session_state.get("scrape_df") is not None:
     df_preview = st.session_state.scrape_df.copy()
-    st.markdown("Tabela identificada:")
-    st.dataframe(df_preview.head(100))
-    fname = f"listings_{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
-    st.download_button(
-        label="Baixar Excel (listings)",
-        data=df_to_excel_bytes_for_listings(df_preview),
-        file_name=fname,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
-    )
+    st.markdown("Prévia dos resultados:")
+    st.dataframe(df_preview.head(200))
+    fname = f"quintoandar_listings_{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
+    st.download_button("Baixar Excel (listings)", data=df_to_excel_bytes(df_preview), file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
-    st.info("Nenhum DataFrame de listings disponível. Execute uma extração de 'Resultados de busca (listings)'.")
-    st.caption("Modo alternativo: extração de texto completo está disponível mas não gera o Excel de listings automaticamente.")
+    st.info("Sem DataFrame disponível. Execute uma extração.")
 
-# =========================
-# Diagnóstico rápido
-# =========================
-with st.expander("Diagnóstico técnico"):
-    st.json({
-        "scrape_url": st.session_state.get("scrape_url"),
-        "has_listings_df": bool(st.session_state.get("scrape_df") is not None),
-        "scrape_mode": scrape_mode,
-    })
+with st.expander("Diagnóstico / Amostras (útil para ajustes)"):
+    st.write("URL atual:", st.session_state.get("scrape_url"))
+    st.write("Config:", st.session_state.settings)
+    st.write("Última amostra (head):")
+    st.text(st.session_state.get("last_raw_sample", {}).get("html_head", "")[:2000])
 
-st.caption("Heurísticas: o scraper tenta extrair campos principais dos cards de resultados e ignorar anúncios/patrocinados. Para alta precisão, informar domínio específico para ajuste fino.")
-
+st.caption("Notas: O scraper tenta extrair dados visíveis na listagem (sem abrir anúncios individuais). Valores monetários e áreas são normalizados para inteiros; campos ausentes ficam como None. Se precisar de precisão total, posso ajustar seletores específicos do domínio com base no HTML completo.")
 

@@ -1,5 +1,3 @@
-Copiar e colar dentro da pasta streamlit_app.py o código abaixo:
-
 import os
 import re
 import json
